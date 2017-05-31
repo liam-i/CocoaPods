@@ -128,6 +128,61 @@ module Pod
             generated.class.should == Xcodeproj::Config
           end
         end
+
+        describe 'test xcconfig generation' do
+          before do
+            @monkey_spec = fixture_spec('monkey/monkey.podspec')
+            @monkey_pod_target = fixture_pod_target(@monkey_spec)
+
+            @banana_spec = fixture_spec('banana-lib/BananaLib.podspec')
+            @banana_pod_target = fixture_pod_target(@banana_spec)
+
+            @coconut_spec = fixture_spec('coconut-lib/CoconutLib.podspec')
+            @coconut_pod_target = fixture_pod_target(@coconut_spec)
+
+            @consumer = @coconut_pod_target.spec_consumers.first
+            @podfile = @coconut_pod_target.podfile
+
+            file_accessors = [Sandbox::FileAccessor.new(fixture('coconut-lib'), @consumer)]
+
+            @coconut_pod_target.stubs(:file_accessors).returns(file_accessors)
+          end
+
+          it 'includes other ld flags for test dependent targets' do
+            @coconut_pod_target.test_dependent_targets = [@monkey_pod_target]
+            generator = PodXCConfig.new(@coconut_pod_target, true)
+            xcconfig = generator.generate
+            xcconfig.to_hash['OTHER_LDFLAGS'].should.include '-l"monkey" -framework "dynamic-monkey"'
+          end
+
+          it 'adds settings for test dependent targets' do
+            @coconut_pod_target.test_dependent_targets = [@banana_pod_target]
+            generator = PodXCConfig.new(@coconut_pod_target, true)
+            xcconfig = generator.generate
+            xcconfig.to_hash['LIBRARY_SEARCH_PATHS'].should == '$(inherited) "$PODS_CONFIGURATION_BUILD_DIR/BananaLib" "$PODS_CONFIGURATION_BUILD_DIR/CoconutLib" "${PODS_ROOT}/../../spec/fixtures/banana-lib"'
+          end
+
+          it 'does not include other ld flags for test dependent targets if its not a test xcconfig' do
+            @coconut_pod_target.test_dependent_targets = [@monkey_pod_target]
+            generator = PodXCConfig.new(@coconut_pod_target)
+            xcconfig = generator.generate
+            xcconfig.to_hash['LIBRARY_SEARCH_PATHS'].should.be.nil
+            xcconfig.to_hash['OTHER_LDFLAGS'].should.be.nil
+          end
+
+          it 'includes default runpath search path list for test xcconfigs' do
+            generator = PodXCConfig.new(@coconut_pod_target, true)
+            xcconfig = generator.generate
+            xcconfig.to_hash['LD_RUNPATH_SEARCH_PATHS'].should == "$(inherited) '@executable_path/Frameworks' '@loader_path/Frameworks'"
+          end
+
+          it 'includes default runpath search path list for test xcconfigs for test bundle' do
+            @coconut_pod_target.stubs(:platform).returns(Platform.new(:osx, '10.10'))
+            generator = PodXCConfig.new(@coconut_pod_target, true)
+            xcconfig = generator.generate
+            xcconfig.to_hash['LD_RUNPATH_SEARCH_PATHS'].should == "$(inherited) '@executable_path/../Frameworks' '@loader_path/../Frameworks'"
+          end
+        end
       end
     end
   end

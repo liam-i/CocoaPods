@@ -30,6 +30,28 @@ module Pod
             @generator.target.relative_pods_root.should == '${SRCROOT}/Pods'
           end
 
+          it 'returns the path of the podfile directory relative to the standard user project' do
+            podfile = @target.target_definition.podfile
+            podfile.stubs(:defined_in_file).returns(Pathname.new(@target.client_root) + 'Podfile')
+            @target.target_definition.stubs(:podfile).returns(podfile)
+            @generator.target.podfile_dir_relative_path.should == '${SRCROOT}/.'
+          end
+
+          it 'returns the path of the podfile directory relative to a nested user project' do
+            podfile = @target.target_definition.podfile
+            podfile.stubs(:defined_in_file).returns(Pathname.new(@target.client_root) + 'Podfile')
+            @target.target_definition.stubs(:podfile).returns(podfile)
+            @target.client_root = Pathname.new(@target.client_root) + 'NestedFolder'
+            @generator.target.podfile_dir_relative_path.should == '${SRCROOT}/..'
+          end
+
+          it 'returns the standard path if the podfile is not defined in file' do
+            podfile = @target.target_definition.podfile
+            podfile.stubs(:defined_in_file).returns(nil)
+            @target.target_definition.stubs(:podfile).returns(podfile)
+            @generator.target.podfile_dir_relative_path.should == '${PODS_ROOT}/..'
+          end
+
           #--------------------------------------------------------------------#
 
           before do
@@ -196,6 +218,11 @@ module Pod
               expected = '$(inherited)'
               @xcconfig.to_hash['HEADER_SEARCH_PATHS'].should.include expected
             end
+
+            it 'includes default runpath search path list when not using frameworks but links a vendored dynamic framework' do
+              @target.stubs(:requires_frameworks?).returns(false)
+              @generator.generate.to_hash['LD_RUNPATH_SEARCH_PATHS'].should == "$(inherited) '@executable_path/Frameworks' '@loader_path/Frameworks'"
+            end
           end
 
           describe 'with a scoped pod target' do
@@ -251,6 +278,20 @@ module Pod
           it 'includes default runpath search path list for a host target' do
             @target.stubs(:requires_host_target?).returns(true)
             @generator.generate.to_hash['LD_RUNPATH_SEARCH_PATHS'].should == "$(inherited) '@executable_path/Frameworks' '@loader_path/Frameworks' '@executable_path/../../Frameworks'"
+          end
+
+          it 'includes correct default runpath search path list for OSX unit test bundle user target' do
+            @target.stubs(:platform).returns(Platform.new(:osx, '10.10'))
+            mock_user_target = mock('usertarget', :symbol_type => :unit_test_bundle)
+            @target.stubs(:user_targets).returns([mock_user_target])
+            @generator.generate.to_hash['LD_RUNPATH_SEARCH_PATHS'].should == "$(inherited) '@executable_path/../Frameworks' '@loader_path/../Frameworks'"
+          end
+
+          it 'includes correct default runpath search path list for OSX application user target' do
+            @target.stubs(:platform).returns(Platform.new(:osx, '10.10'))
+            mock_user_target = mock('usertarget', :symbol_type => :application)
+            @target.stubs(:user_targets).returns([mock_user_target])
+            @generator.generate.to_hash['LD_RUNPATH_SEARCH_PATHS'].should == "$(inherited) '@executable_path/../Frameworks' '@loader_path/Frameworks'"
           end
 
           it 'uses the target definition swift version' do

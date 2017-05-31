@@ -61,9 +61,7 @@ module Pod
       before do
         @installer.stubs(:resolve_dependencies)
         @installer.stubs(:download_dependencies)
-        @installer.stubs(:verify_no_duplicate_framework_and_library_names)
-        @installer.stubs(:verify_no_static_framework_transitive_dependencies)
-        @installer.stubs(:verify_framework_usage)
+        @installer.stubs(:validate_targets)
         @installer.stubs(:generate_pods_project)
         @installer.stubs(:integrate_user_project)
         @installer.stubs(:run_plugins_post_install_hooks)
@@ -160,6 +158,23 @@ module Pod
         UI.output.should.include 'Skipping User Project Integration'
       end
 
+      it 'includes pod targets from test dependent targets' do
+        pod_target_one = stub(:test_dependent_targets => [])
+        pod_target_three = stub(:test_dependent_targets => [])
+        pod_target_two = stub(:test_dependent_targets => [pod_target_three])
+        aggregate_target = stub(:pod_targets => [pod_target_one, pod_target_two])
+
+        result = stub(:targets => [aggregate_target])
+
+        analyzer = Installer::Analyzer.new(config.sandbox, @installer.podfile, @installer.lockfile)
+        analyzer.stubs(:analyze).returns(result)
+        analyzer.stubs(:result).returns(result)
+
+        @installer.stubs(:create_analyzer).returns(analyzer)
+        @installer.send(:analyze)
+        @installer.pod_targets.should == [pod_target_one, pod_target_two, pod_target_three]
+      end
+
       it 'prints a list of deprecated pods' do
         spec = Spec.new
         spec.name = 'RestKit'
@@ -254,139 +269,6 @@ module Pod
           matryoshka
           monkey
         )
-      end
-    end
-
-    #-------------------------------------------------------------------------#
-
-    describe '#verify_no_duplicate_framework_and_library_names' do
-      it 'detects duplicate library names' do
-        Sandbox::FileAccessor.any_instance.stubs(:vendored_libraries).returns([Pathname('a/libBananalib.a')])
-        Pod::Specification.any_instance.stubs(:dependencies).returns([])
-        fixture_path = ROOT + 'spec/fixtures'
-        config.repos_dir = fixture_path + 'spec-repos'
-        podfile = Pod::Podfile.new do
-          platform :ios, '8.0'
-          project 'SampleProject/SampleProject'
-          pod 'BananaLib', :path => (fixture_path + 'banana-lib').to_s
-          target 'SampleProject'
-        end
-        lockfile = generate_lockfile
-
-        @installer = Installer.new(config.sandbox, podfile, lockfile)
-        @installer.installation_options.integrate_targets = false
-        should.raise(Informative) { @installer.install! }.message.should.match /conflict.*bananalib/
-      end
-
-      it 'detects duplicate framework names' do
-        Sandbox::FileAccessor.any_instance.stubs(:vendored_frameworks).
-          returns([Pathname('a/monkey.framework')]).then.
-          returns([Pathname('b/monkey.framework')]).then.
-          returns([Pathname('c/monkey.framework')])
-        fixture_path = ROOT + 'spec/fixtures'
-        config.repos_dir = fixture_path + 'spec-repos'
-        podfile = Pod::Podfile.new do
-          platform :ios, '8.0'
-          project 'SampleProject/SampleProject'
-          pod 'BananaLib',       :path => (fixture_path + 'banana-lib').to_s
-          pod 'OrangeFramework', :path => (fixture_path + 'orange-framework').to_s
-          pod 'matryoshka',      :path => (fixture_path + 'matryoshka').to_s
-          pod 'monkey',          :path => (fixture_path + 'monkey').to_s
-          target 'SampleProject'
-        end
-        lockfile = generate_lockfile
-
-        @installer = Installer.new(config.sandbox, podfile, lockfile)
-        @installer.installation_options.integrate_targets = false
-        should.raise(Informative) { @installer.install! }.message.should.match /conflict.*monkey/
-      end
-
-      it 'allows duplicate references to the same expanded framework path' do
-        Sandbox::FileAccessor.any_instance.stubs(:vendored_frameworks).returns([fixture('monkey/dynamic-monkey.framework')])
-        Sandbox::FileAccessor.any_instance.stubs(:dynamic_binary?).returns(true)
-        fixture_path = ROOT + 'spec/fixtures'
-        config.repos_dir = fixture_path + 'spec-repos'
-        podfile = Pod::Podfile.new do
-          platform :ios, '8.0'
-          project 'SampleProject/SampleProject'
-          use_frameworks!
-          pod 'BananaLib',       :path => (fixture_path + 'banana-lib').to_s
-          pod 'monkey',          :path => (fixture_path + 'monkey').to_s
-          target 'SampleProject'
-        end
-        lockfile = generate_lockfile
-
-        @installer = Installer.new(config.sandbox, podfile, lockfile)
-        @installer.installation_options.integrate_targets = false
-        should.not.raise(Informative) { @installer.install! }
-      end
-    end
-
-    #-------------------------------------------------------------------------#
-
-    describe '#verify_no_static_framework_transitive_dependencies' do
-      before do
-        fixture_path = ROOT + 'spec/fixtures'
-        config.repos_dir = fixture_path + 'spec-repos'
-        @podfile = Pod::Podfile.new do
-          install! 'cocoapods', 'integrate_targets' => false
-          platform :ios, '8.0'
-          project 'SampleProject/SampleProject'
-          use_frameworks!
-          pod 'BananaLib',       :path => (fixture_path + 'banana-lib').to_s
-          pod 'OrangeFramework', :path => (fixture_path + 'orange-framework').to_s
-          pod 'matryoshka',      :path => (fixture_path + 'matryoshka').to_s
-          pod 'monkey',          :path => (fixture_path + 'monkey').to_s
-          target 'SampleProject'
-        end
-        @lockfile = generate_lockfile
-
-        @file = Pathname('/yolo.m')
-        @file.stubs(:realpath).returns(@file)
-
-        @lib_thing = Pathname('/libThing.a')
-        @lib_thing.stubs(:realpath).returns(@lib_thing)
-      end
-
-      it 'detects transitive static dependencies which are linked directly to the user target' do
-        Sandbox::FileAccessor.any_instance.stubs(:vendored_libraries).returns([@lib_thing])
-        @installer = Installer.new(config.sandbox, @podfile, @lockfile)
-        should.raise(Informative) { @installer.install! }.message.should.match /transitive.*libThing/
-      end
-
-      it 'allows transitive static dependencies which contain other source code' do
-        Sandbox::FileAccessor.any_instance.stubs(:source_files).returns([@file])
-        Sandbox::FileAccessor.any_instance.stubs(:vendored_libraries).returns([@lib_thing])
-        @installer = Installer.new(config.sandbox, @podfile, @lockfile)
-        should.not.raise(Informative) { @installer.install! }
-      end
-
-      it 'allows transitive static dependencies when both dependencies are linked against the user target' do
-        PodTarget.any_instance.stubs(:should_build? => false)
-        Sandbox::FileAccessor.any_instance.stubs(:vendored_libraries).returns([@lib_thing])
-        @installer = Installer.new(config.sandbox, @podfile, @lockfile)
-        should.not.raise(Informative) { @installer.install! }
-      end
-    end
-
-    #-------------------------------------------------------------------------#
-
-    describe '#verify_framework_usage' do
-      it 'raises when Swift pods are used without explicit `use_frameworks!`' do
-        fixture_path = ROOT + 'spec/fixtures'
-        config.repos_dir = fixture_path + 'spec-repos'
-        podfile = Pod::Podfile.new do
-          platform :ios, '8.0'
-          project 'SampleProject/SampleProject'
-          pod 'OrangeFramework', :path => (fixture_path + 'orange-framework').to_s
-          pod 'matryoshka',      :path => (fixture_path + 'matryoshka').to_s
-          target 'SampleProject'
-        end
-        lockfile = generate_lockfile
-
-        @installer = Installer.new(config.sandbox, podfile, lockfile)
-        @installer.installation_options.integrate_targets = false
-        should.raise(Informative) { @installer.install! }.message.should.match /use_frameworks/
       end
     end
 
@@ -538,6 +420,16 @@ module Pod
           @installer.expects(:install_source_of_pod).with('RestKit')
           @installer.send(:install_pod_sources)
           UI.output.should.include 'was 1.0'
+        end
+
+        it 'raises when it attempts to install pod source with no target supporting it' do
+          spec = fixture_spec('banana-lib/BananaLib.podspec')
+          pod_target = PodTarget.new([spec], [fixture_target_definition], config.sandbox)
+          pod_target.stubs(:platform).returns(:ios)
+          @installer.stubs(:pod_targets).returns([pod_target])
+          should.raise Informative do
+            @installer.send(:create_pod_installer, 'RandomPod')
+          end.message.should.include 'Could not install \'RandomPod\' pod. There is no target that supports it.'
         end
 
         #--------------------------------------#

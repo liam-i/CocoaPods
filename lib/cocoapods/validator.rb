@@ -28,8 +28,12 @@ module Pod
     #         the Source URLs to use in creating a {Podfile}.
     #
     def initialize(spec_or_path, source_urls)
-      @source_urls = source_urls.map { |url| config.sources_manager.source_with_name_or_url(url) }.map(&:url)
       @linter = Specification::Linter.new(spec_or_path)
+      @source_urls = if @linter.spec && @linter.spec.dependencies.empty?
+                       []
+                     else
+                       source_urls.map { |url| config.sources_manager.source_with_name_or_url(url) }.map(&:url)
+                     end
     end
 
     #-------------------------------------------------------------------------#
@@ -142,15 +146,8 @@ module Pod
         reasons << 'all results apply only to public specs, but you can use ' \
                    '`--private` to ignore them if linting the specification for a private pod'
       end
-      if dot_swift_version.nil?
-        reasons.to_sentence + ".\n[!] The validator for Swift projects uses " \
-          'Swift 3.0 by default, if you are using a different version of ' \
-          'swift you can use a `.swift-version` file to set the version for ' \
-          "your Pod. For example to use Swift 2.3, run: \n" \
-          '    `echo "2.3" > .swift-version`'
-      else
-        reasons.to_sentence
-      end
+
+      reasons.to_sentence
     end
 
     #-------------------------------------------------------------------------#
@@ -202,6 +199,9 @@ module Pod
     #
     attr_accessor :ignore_public_only_results
 
+    attr_accessor :skip_import_validation
+    alias_method :skip_import_validation?, :skip_import_validation
+
     #-------------------------------------------------------------------------#
 
     # !@group Lint results
@@ -242,7 +242,7 @@ module Pod
     # @return [Pathname] the temporary directory used by the linter.
     #
     def validation_dir
-      Pathname(Dir.tmpdir) + 'CocoaPods/Lint'
+      @validation_dir ||= Pathname(Dir.mktmpdir(['CocoaPods-Lint-', "-#{spec.name}"]))
     end
 
     # @return [String] the SWIFT_VERSION to use for validation.
@@ -301,6 +301,7 @@ module Pod
           download_pod
           check_file_patterns
           install_pod
+          validate_dot_swift_version
           add_app_project_import
           validate_vendored_dynamic_frameworks
           build_pod
@@ -375,6 +376,17 @@ module Pod
       validate_url(spec.documentation_url) if spec.documentation_url
     end
 
+    def validate_dot_swift_version
+      if !used_swift_version.nil? && dot_swift_version.nil?
+        warning(:swift_version,
+                'The validator for Swift projects uses ' \
+                'Swift 3.0 by default, if you are using a different version of ' \
+                'swift you can use a `.swift-version` file to set the version for ' \
+                "your Pod. For example to use Swift 2.3, run: \n" \
+                '    `echo "2.3" > .swift-version`')
+      end
+    end
+
     def setup_validation_environment
       validation_dir.rmtree if validation_dir.exist?
       validation_dir.mkpath
@@ -402,6 +414,7 @@ module Pod
       sandbox = Sandbox.new(config.sandbox_root)
       @installer = Installer.new(sandbox, podfile)
       @installer.use_default_plugins = false
+      @installer.has_dependencies = !spec.dependencies.empty?
       %i(prepare resolve_dependencies download_dependencies).each { |m| @installer.send(m) }
       @file_accessor = @installer.pod_targets.flat_map(&:file_accessors).find { |fa| fa.spec.name == consumer.spec.name }
     end
@@ -411,7 +424,6 @@ module Pod
       app_project.new_target(:application, 'App', consumer.platform_name, deployment_target)
       app_project.save
       app_project.recreate_user_schemes
-      Xcodeproj::XCScheme.share_scheme(app_project.path, 'App')
     end
 
     def add_app_project_import
@@ -425,6 +437,9 @@ module Pod
       add_swift_version(app_target)
       add_xctest(app_target) if @installer.pod_targets.any? { |pt| pt.spec_consumers.any? { |c| c.frameworks.include?('XCTest') } }
       app_project.save
+      Xcodeproj::XCScheme.share_scheme(app_project.path, 'App')
+      # Share the pods xcscheme only if it exists. For pre-built vendored pods there is no xcscheme generated.
+      Xcodeproj::XCScheme.share_scheme(@installer.pods_project.path, pod_target.label) if shares_pod_target_xcscheme?(pod_target)
     end
 
     def add_swift_version(app_target)
@@ -475,9 +490,7 @@ module Pod
     # for all available platforms with xcodebuild.
     #
     def install_pod
-      %i(verify_no_duplicate_framework_and_library_names
-         verify_no_static_framework_transitive_dependencies
-         verify_framework_usage generate_pods_project integrate_user_project
+      %i(validate_targets generate_pods_project integrate_user_project
          perform_post_install_actions).each { |m| @installer.send(m) }
 
       deployment_target = spec.subspec_by_name(subspec_name).deployment_target(consumer.platform_name)
@@ -665,6 +678,10 @@ module Pod
       add_result(:note, *args)
     end
 
+    def shares_pod_target_xcscheme?(pod_target)
+      Pathname.new(@installer.pods_project.path + pod_target.label).exist?
+    end
+
     def add_result(type, attribute_name, message, public_only = false)
       result = results.find do |r|
         r.type == type && r.attribute_name && r.message == message && r.public_only? == public_only
@@ -764,7 +781,12 @@ module Pod
     #
     def xcodebuild
       require 'fourflusher'
-      command = ['clean', 'build', '-workspace', File.join(validation_dir, 'App.xcworkspace'), '-scheme', 'App', '-configuration', 'Release']
+      scheme = if skip_import_validation?
+                 @installer.pod_targets.find { |pt| pt.pod_name == spec.root.name }.label
+               else
+                 'App'
+      end
+      command = %W(clean build -workspace #{File.join(validation_dir, 'App.xcworkspace')} -scheme #{scheme} -configuration Release)
       case consumer.platform_name
       when :osx, :macos
         command += %w(CODE_SIGN_IDENTITY=)

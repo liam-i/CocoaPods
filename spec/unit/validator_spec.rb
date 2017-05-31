@@ -1,20 +1,18 @@
 require File.expand_path('../../spec_helper', __FILE__)
 require 'webmock'
 
-module Bacon
-  class Context
-    alias_method :after_webmock, :after
-    def after(&block)
-      after_webmock do
-        block.call
-        WebMock.reset!
-      end
-    end
-  end
-end
-
 module Pod
   describe Validator do
+    before do
+      WebMock.enable!
+      WebMock.disable_net_connect!
+    end
+
+    after do
+      WebMock.reset!
+      WebMock.disable!
+    end
+
     before do
       Validator.any_instance.stubs(:xcodebuild).returns('')
       Validator.any_instance.stubs(:xcodebuild_available?).returns(true)
@@ -90,7 +88,7 @@ module Pod
         validator.quick = true
         validator.stubs(:validate_url)
         validator.validate
-        validator.validation_dir.should.be == Pathname.new(Dir.tmpdir) + 'CocoaPods/Lint'
+        validator.validated?.should.be.true
       end
 
       describe '#only_subspec' do
@@ -295,6 +293,7 @@ module Pod
         validator.stubs(:validate_url)
         validator.expects(:install_pod).times(4)
         validator.expects(:build_pod).times(4)
+        validator.expects(:add_app_project_import).times(4)
         validator.expects(:check_file_patterns).times(4)
         validator.validate
       end
@@ -373,13 +372,44 @@ module Pod
         end
       end
 
-      it 'repects the source_urls parameter' do
+      it 'empties sources when no dependencies' do
         sources = %w(master https://github.com/CocoaPods/Specs.git)
         Command::Repo::Add.any_instance.stubs(:run)
         validator = Validator.new(podspec_path, sources)
         validator.stubs(:validate_url)
         podfile = validator.send(:podfile_from_spec, :ios, '5.0')
+        podfile.sources.should == %w()
+      end
+
+      it 'repects the source_urls parameter when there are dependencies' do
+        podspec = stub_podspec(/.*name.*/, '"name": "SBJson",').gsub(/.*version.*/, '"version": "3.2",')
+        file = write_podspec(podspec, 'SBJson.podspec.json')
+        spec = Specification.from_file(file)
+        set = mock
+        set.stubs(:all_specifications).returns([spec])
+        Source::Aggregate.any_instance.stubs(:search).with(Dependency.new('SBJson', '~> 3.2')).returns(set)
+
+        podspec = stub_podspec(/.*name.*/, '"name": "ZKit",')
+        podspec.gsub!(/.*requires_arc.*/, '"dependencies": { "SBJson": [ "~> 3.2" ] }, "requires_arc": false')
+        file = write_podspec(podspec, 'ZKit.podspec.json')
+
+        spec = Specification.from_file(file)
+
+        sources = %w(master https://github.com/CocoaPods/Specs.git)
+        Command::Repo::Add.any_instance.stubs(:run)
+        validator = Validator.new(spec, sources)
+        validator.stubs(:validate_url)
+        podfile = validator.send(:podfile_from_spec, :ios, '5.0')
         podfile.sources.should == %w(https://github.com/CocoaPods/Specs.git)
+      end
+
+      it 'avoids creation of sources when no dependencies' do
+        sources = %w(master https://github.com/CocoaPods/Specs.git)
+        config.sources_manager.expects(:find_or_create_source_with_url).never
+        Command::Repo::Add.any_instance.stubs(:run)
+        validator = Validator.new(podspec_path, sources)
+        validator.stubs(:validate_url)
+        validator.validate
       end
 
       it 'uses xcodebuild to generate warnings' do
@@ -421,6 +451,31 @@ module Pod
         first = validator.results.map(&:to_s).first
         first.should.include '[xcodebuild] Returned an unsuccessful exit code'
         validator.result_type.should == :error
+      end
+
+      it 'runs xcodebuild with correct arguments when skipping import validation' do
+        require 'fourflusher'
+        Fourflusher::SimControl.any_instance.stubs(:destination).returns(['-destination', 'id=XXX'])
+        Validator.any_instance.unstub(:xcodebuild)
+        validator = Validator.new(podspec_path, config.sources_manager.master.map(&:url))
+        validator.stubs(:check_file_patterns)
+        validator.stubs(:validate_url)
+        validator.skip_import_validation = true
+        git = Executable.which(:git)
+        Executable.stubs(:which).with('git').returns(git)
+        Executable.stubs(:capture_command).with('git', ['config', '--get', 'remote.origin.url'], :capture => :out).returns(['https://github.com/CocoaPods/Specs.git'])
+        Executable.stubs(:which).with(:xcrun)
+        # Command should include the pod target 'JSONKit' instead of the 'App' target.
+        command = ['clean', 'build', '-workspace', File.join(validator.validation_dir, 'App.xcworkspace'), '-scheme', 'JSONKit', '-configuration', 'Release']
+        args = %w(CODE_SIGN_IDENTITY=)
+        Executable.expects(:capture_command).with('xcodebuild', command + args, :capture => :merge).once.returns(['', stub(:success? => true)])
+        args = %w(CODE_SIGN_IDENTITY=- -sdk appletvsimulator) + Fourflusher::SimControl.new.destination('Apple TV 1080p')
+        Executable.expects(:capture_command).with('xcodebuild', command + args, :capture => :merge).once.returns(['', stub(:success? => true)])
+        args = %w(CODE_SIGN_IDENTITY=- -sdk iphonesimulator) + Fourflusher::SimControl.new.destination('iPhone 4s')
+        Executable.expects(:capture_command).with('xcodebuild', command + args, :capture => :merge).once.returns(['', stub(:success? => true)])
+        args = %w(CODE_SIGN_IDENTITY=- -sdk watchsimulator) + Fourflusher::SimControl.new.destination('Apple Watch - 38mm')
+        Executable.expects(:capture_command).with('xcodebuild', command + args, :capture => :merge).once.returns(['', stub(:success? => true)])
+        validator.validate
       end
 
       it 'runs xcodebuild with correct arguments for code signing' do
@@ -582,9 +637,15 @@ module Pod
         it 'adds the importing file to the app target' do
           @validator.stubs(:use_frameworks).returns(true)
           @validator.send(:create_app_project)
+          pods_project = Xcodeproj::Project.new(@validator.validation_dir + 'Pods/Pods.xcodeproj')
+          app_project_path = @validator.validation_dir + 'App.xcodeproj'
           pod_target = fixture_pod_target('banana-lib/BananaLib.podspec')
           pod_target.stubs(:uses_swift? => true, :pod_name => 'JSONKit')
           installer = stub(:pod_targets => [pod_target])
+          installer.stubs(:pods_project).returns(pods_project)
+          Xcodeproj::XCScheme.expects(:share_scheme).with(app_project_path, 'App').once
+          Xcodeproj::XCScheme.expects(:share_scheme).with(pods_project.path, 'BananaLib').once
+          @validator.stubs(:shares_pod_target_xcscheme?).returns(true)
           @validator.instance_variable_set(:@installer, installer)
           @validator.send(:add_app_project_import)
 
@@ -598,17 +659,39 @@ module Pod
 
         it 'adds developer framework paths when the pod depends on XCTest' do
           @validator.send(:create_app_project)
+          pods_project = Xcodeproj::Project.new(@validator.validation_dir + 'Pods/Pods.xcodeproj')
+          app_project_path = @validator.validation_dir + 'App.xcodeproj'
           pod_target = fixture_pod_target('banana-lib/BananaLib.podspec')
           pod_target.stubs(:uses_swift? => true, :pod_name => 'JSONKit')
           pod_target.spec_consumers.first.stubs(:frameworks).returns(%w(XCTest))
           installer = stub(:pod_targets => [pod_target])
+          installer.stubs(:pods_project).returns(pods_project)
+          Xcodeproj::XCScheme.expects(:share_scheme).with(app_project_path, 'App').once
+          Xcodeproj::XCScheme.expects(:share_scheme).with(pods_project.path, 'BananaLib').once
+          @validator.stubs(:shares_pod_target_xcscheme?).returns(true)
           @validator.instance_variable_set(:@installer, installer)
           @validator.send(:add_app_project_import)
 
-          project = Xcodeproj::Project.open(@validator.validation_dir + 'App.xcodeproj')
-          project.native_targets.first.build_configurations.map do |bc|
+          app_project = Xcodeproj::Project.open(app_project_path)
+          app_project.native_targets.first.build_configurations.map do |bc|
             bc.build_settings['FRAMEWORK_SEARCH_PATHS']
           end.uniq.should == [%w($(inherited) "$(PLATFORM_DIR)/Developer/Library/Frameworks")]
+        end
+
+        it 'does not share xcscheme for pod target if there isnt one' do
+          @validator.send(:create_app_project)
+          pods_project = Xcodeproj::Project.new(@validator.validation_dir + 'Pods/Pods.xcodeproj')
+          app_project_path = @validator.validation_dir + 'App.xcodeproj'
+          pod_target = fixture_pod_target('banana-lib/BananaLib.podspec')
+          pod_target.stubs(:uses_swift? => true, :pod_name => 'JSONKit')
+          pod_target.spec_consumers.first.stubs(:frameworks).returns(%w(XCTest))
+          installer = stub(:pod_targets => [pod_target])
+          installer.stubs(:pods_project).returns(pods_project)
+          Xcodeproj::XCScheme.expects(:share_scheme).with(app_project_path, 'App').once
+          Xcodeproj::XCScheme.expects(:share_scheme).with(pods_project.path, 'BananaLib').never
+          @validator.stubs(:shares_pod_target_xcscheme?).returns(false)
+          @validator.instance_variable_set(:@installer, installer)
+          @validator.send(:add_app_project_import)
         end
       end
 
@@ -787,8 +870,14 @@ module Pod
         validator
       end
 
-      it 'fails on deployment target < iOS 8 for Swift Pods' do
+      def test_swiftpod_with_dot_swift_version(version = '3.1.0')
         validator = test_swiftpod
+        validator.stubs(:dot_swift_version).returns(version)
+        validator
+      end
+
+      it 'fails on deployment target < iOS 8 for Swift Pods' do
+        validator = test_swiftpod_with_dot_swift_version
         validator.validate
 
         validator.results.map(&:to_s).first.should.match /dynamic frameworks.*iOS > 8/
@@ -798,7 +887,7 @@ module Pod
       it 'succeeds on deployment target < iOS 8 for Swift Pods using XCTest' do
         Specification::Consumer.any_instance.stubs(:frameworks).returns(%w(XCTest))
 
-        validator = test_swiftpod
+        validator = test_swiftpod_with_dot_swift_version
         validator.validate
         validator.results.count.should == 0
       end
@@ -806,25 +895,34 @@ module Pod
       it 'succeeds on deployment targets >= iOS 8 for Swift Pods' do
         Specification.any_instance.stubs(:deployment_target).returns('9.0')
 
-        validator = test_swiftpod
+        validator = test_swiftpod_with_dot_swift_version
         validator.validate
 
         validator.results.count.should == 0
       end
 
-      it 'tells users about the .swift-version file if the validation fails' do
+      it 'fails without the presence of a .swift-version file for Swift Pods' do
         Specification.any_instance.stubs(:deployment_target).returns('9.0')
 
         validator = test_swiftpod
-        validator.stubs(:validated?).returns(false)
-        result = Validator::Result.new(:error, 'attribute', 'message')
-        validator.stubs(:results).returns([result])
+        validator.validate
+        validator.results.count.should == 1
 
-        validator.failure_reason.should == "1 error.\n[!] The validator for " \
+        result = validator.results.first
+        result.type.should == :warning
+        result.message.should == 'The validator for ' \
           'Swift projects uses Swift 3.0 by default, if you are using a ' \
           'different version of swift you can use a `.swift-version` file ' \
           'to set the version for your Pod. For example to use Swift 2.3, ' \
           "run: \n    `echo \"2.3\" > .swift-version`"
+      end
+
+      it 'succeeds with the presence of a .swift-version file for Swift Pods' do
+        Specification.any_instance.stubs(:deployment_target).returns('9.0')
+
+        validator = test_swiftpod_with_dot_swift_version
+        validator.validate
+        validator.results.count.should == 0
       end
 
       describe '#swift_version' do

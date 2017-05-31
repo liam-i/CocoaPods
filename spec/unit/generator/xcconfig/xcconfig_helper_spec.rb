@@ -156,7 +156,7 @@ module Pod
             @sut.add_library_build_settings(path, xcconfig, config.sandbox.root)
             hash_config = xcconfig.to_hash
             hash_config['OTHER_LDFLAGS'].should == '-l"Proj4"'
-            hash_config['LIBRARY_SEARCH_PATHS'].should == '$(inherited) "${PODS_ROOT}/MapBox/Proj4"'
+            hash_config['LIBRARY_SEARCH_PATHS'].should == '"${PODS_ROOT}/MapBox/Proj4"'
           end
 
           it 'adds dylib build settings to the given xcconfig' do
@@ -165,7 +165,7 @@ module Pod
             @sut.add_library_build_settings(path, xcconfig, config.sandbox.root)
             hash_config = xcconfig.to_hash
             hash_config['OTHER_LDFLAGS'].should == '-l"Proj4"'
-            hash_config['LIBRARY_SEARCH_PATHS'].should == '$(inherited) "${PODS_ROOT}/MapBox/Proj4"'
+            hash_config['LIBRARY_SEARCH_PATHS'].should == '"${PODS_ROOT}/MapBox/Proj4"'
           end
         end
 
@@ -218,6 +218,114 @@ module Pod
             @sut.add_language_specific_settings(target, xcconfig)
             other_swift_flags = xcconfig.to_hash['OTHER_SWIFT_FLAGS']
             other_swift_flags.should.include?('-suppress-warnings')
+          end
+        end
+
+        #---------------------------------------------------------------------#
+
+        describe 'for proper other ld flags' do
+          before do
+            @root = fixture('banana-lib')
+            @path_list = Sandbox::PathList.new(@root)
+            @spec = fixture_spec('banana-lib/BananaLib.podspec')
+            @spec_consumer = @spec.consumer(:ios)
+            @accessor = Pod::Sandbox::FileAccessor.new(@path_list, @spec_consumer)
+          end
+
+          it 'should not include static framework other ld flags when inheriting search paths' do
+            target_definition = stub(:inheritance => 'search_paths')
+            aggregate_target = stub(:target_definition => target_definition, :pod_targets => [], :search_paths_aggregate_targets => [])
+            pod_target = stub(:sandbox => config.sandbox)
+            xcconfig = Xcodeproj::Config.new
+            @sut.add_static_dependency_build_settings(aggregate_target, pod_target, xcconfig, @accessor)
+            xcconfig.to_hash['LIBRARY_SEARCH_PATHS'].should == '"${PODS_ROOT}/../../spec/fixtures/banana-lib"'
+            xcconfig.to_hash['FRAMEWORK_SEARCH_PATHS'].should == '"${PODS_ROOT}/../../spec/fixtures/banana-lib"'
+            xcconfig.to_hash['OTHER_LDFLAGS'].should.be.nil
+          end
+
+          it 'should include static framework other ld flags when inheriting search paths but explicitly declared' do
+            target_definition = stub(:inheritance => 'search_paths')
+            pod_target = stub(:name => 'BananaLib', :sandbox => config.sandbox)
+            aggregate_target = stub(:target_definition => target_definition, :pod_targets => [pod_target], :search_paths_aggregate_targets => [])
+            xcconfig = Xcodeproj::Config.new
+            @sut.add_static_dependency_build_settings(aggregate_target, pod_target, xcconfig, @accessor)
+            xcconfig.to_hash['LIBRARY_SEARCH_PATHS'].should == '"${PODS_ROOT}/../../spec/fixtures/banana-lib"'
+            xcconfig.to_hash['FRAMEWORK_SEARCH_PATHS'].should == '"${PODS_ROOT}/../../spec/fixtures/banana-lib"'
+            xcconfig.to_hash['OTHER_LDFLAGS'].should == '-l"Bananalib" -framework "Bananalib"'
+          end
+
+          it 'should include static framework other ld flags when not inheriting search paths' do
+            target_definition = stub(:inheritance => 'complete')
+            aggregate_target = stub(:target_definition => target_definition)
+            pod_target = stub(:sandbox => config.sandbox)
+            xcconfig = Xcodeproj::Config.new
+            @sut.add_static_dependency_build_settings(aggregate_target, pod_target, xcconfig, @accessor)
+            xcconfig.to_hash['LIBRARY_SEARCH_PATHS'].should == '"${PODS_ROOT}/../../spec/fixtures/banana-lib"'
+            xcconfig.to_hash['FRAMEWORK_SEARCH_PATHS'].should == '"${PODS_ROOT}/../../spec/fixtures/banana-lib"'
+            xcconfig.to_hash['OTHER_LDFLAGS'].should == '-l"Bananalib" -framework "Bananalib"'
+          end
+
+          it 'should include static framework for pod targets' do
+            pod_target = stub(:sandbox => config.sandbox)
+            xcconfig = Xcodeproj::Config.new
+            @sut.add_static_dependency_build_settings(nil, pod_target, xcconfig, @accessor)
+            xcconfig.to_hash['LIBRARY_SEARCH_PATHS'].should == '"${PODS_ROOT}/../../spec/fixtures/banana-lib"'
+            xcconfig.to_hash['FRAMEWORK_SEARCH_PATHS'].should == '"${PODS_ROOT}/../../spec/fixtures/banana-lib"'
+            xcconfig.to_hash['OTHER_LDFLAGS'].should == '-l"Bananalib" -framework "Bananalib"'
+          end
+
+          it 'should link static dependency for pod targets' do
+            pod_target = stub(:name => 'BananaLib', :sandbox => config.sandbox)
+            @sut.links_dependency?(nil, pod_target).should.be.true
+          end
+
+          it 'should link static dependency when target explicitly specifies it' do
+            target_definition = stub(:inheritance => 'complete')
+            pod_target = stub(:name => 'BananaLib', :sandbox => config.sandbox)
+            aggregate_target = stub(:target_definition => target_definition, :pod_targets => [pod_target], :search_paths_aggregate_targets => [])
+            @sut.links_dependency?(aggregate_target, pod_target).should.be.true
+          end
+
+          it 'should link static dependency when target explicitly specifies it even with search paths' do
+            target_definition = stub(:inheritance => 'search_paths')
+            pod_target = stub(:name => 'BananaLib', :sandbox => config.sandbox)
+            aggregate_target = stub(:target_definition => target_definition, :pod_targets => [pod_target], :search_paths_aggregate_targets => [])
+            @sut.links_dependency?(aggregate_target, pod_target).should.be.true
+          end
+
+          it 'should not link static dependency when inheriting search paths and parent includes dependency' do
+            parent_target_definition = stub
+            child_target_definition = stub(:inheritance => 'search_paths')
+            pod_target = stub(:name => 'BananaLib', :sandbox => config.sandbox)
+            parent_aggregate_target = stub(:target_definition => parent_target_definition, :pod_targets => [pod_target], :search_paths_aggregate_targets => [])
+            child_aggregate_target = stub(:target_definition => child_target_definition, :pod_targets => [], :search_paths_aggregate_targets => [parent_aggregate_target])
+            @sut.links_dependency?(child_aggregate_target, pod_target).should.be.false
+          end
+
+          it 'should link static transitive dependencies if the parent does not link them' do
+            child_pod_target = stub(:name => 'ChildPod', :sandbox => config.sandbox)
+            parent_pod_target = stub(:name => 'ParentPod', :sandbox => config.sandbox, :dependent_targets => [child_pod_target])
+
+            parent_target_definition = stub
+            child_target_definition = stub(:inheritance => 'search_paths')
+
+            parent_aggregate_target = stub(:target_definition => parent_target_definition, :pod_targets => [], :search_paths_aggregate_targets => [])
+            child_aggregate_target = stub(:target_definition => child_target_definition, :pod_targets => [parent_pod_target, child_pod_target], :search_paths_aggregate_targets => [parent_aggregate_target])
+            @sut.links_dependency?(child_aggregate_target, child_pod_target).should.be.true
+            @sut.links_dependency?(child_aggregate_target, parent_pod_target).should.be.true
+          end
+
+          it 'should link static only transitive dependencies that the parent does not link' do
+            child_pod_target = stub(:name => 'ChildPod', :sandbox => config.sandbox)
+            parent_pod_target = stub(:name => 'ParentPod', :sandbox => config.sandbox, :dependent_targets => [child_pod_target])
+
+            parent_target_definition = stub
+            child_target_definition = stub(:inheritance => 'search_paths')
+
+            parent_aggregate_target = stub(:target_definition => parent_target_definition, :pod_targets => [child_pod_target], :search_paths_aggregate_targets => [])
+            child_aggregate_target = stub(:target_definition => child_target_definition, :pod_targets => [parent_pod_target, child_pod_target], :search_paths_aggregate_targets => [parent_aggregate_target])
+            @sut.links_dependency?(child_aggregate_target, child_pod_target).should.be.false
+            @sut.links_dependency?(child_aggregate_target, parent_pod_target).should.be.true
           end
         end
 

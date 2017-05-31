@@ -2,10 +2,20 @@ require 'molinillo'
 require 'cocoapods/resolver/lazy_specification'
 
 module Pod
+  class NoSpecFoundError < Informative
+    def exit_status
+      @exit_status ||= 31
+    end
+  end
+
   # The resolver is responsible of generating a list of specifications grouped
   # by target for a given Podfile.
   #
   class Resolver
+    include Pod::Installer::InstallationOptions::Mixin
+
+    delegate_installation_options { podfile }
+
     # @return [Sandbox] the Sandbox used by the resolver to find external
     #         dependencies.
     #
@@ -24,6 +34,11 @@ module Pod
     #         the resolution.
     #
     attr_accessor :sources
+
+    # @return [Bool] Whether the resolver has sources repositories up-to-date.
+    #
+    attr_accessor :specs_updated
+    alias specs_updated? specs_updated
 
     # Init a new Resolver
     #
@@ -288,9 +303,9 @@ module Pod
     def specifications_for_dependency(dependency, additional_requirements = [])
       requirement = Requirement.new(dependency.requirement.as_list + additional_requirements)
       find_cached_set(dependency).
-        all_specifications.
+        all_specifications(installation_options.warn_for_multiple_pod_sources).
         select { |s| requirement.satisfied_by? s.version }.
-        map { |s| s.subspec_by_name(dependency.name, false) }.
+        map { |s| s.subspec_by_name(dependency.name, false, true) }.
         compact.
         reverse
     end
@@ -385,6 +400,7 @@ module Pod
     #
     def handle_resolver_error(error)
       message = error.message.dup
+      type = Informative
       case error
       when Molinillo::VersionConflict
         error.conflicts.each do |name, conflict|
@@ -423,12 +439,15 @@ module Pod
             found_conflicted_specs = conflicts.reject { |c| search_for(c).empty? }
             if found_conflicted_specs.empty?
               # There are no existing specification inside any of the spec repos with given requirements.
+              type = NoSpecFoundError
               dependencies = conflicts.count == 1 ? 'dependency' : 'dependencies'
               message << "\n\nNone of your spec sources contain a spec satisfying "\
                 "the #{dependencies}: `#{conflicts.join(', ')}`." \
-                "\n\nYou have either:" \
-                "\n * out-of-date source repos which you can update with `pod repo update`." \
-                "\n * mistyped the name or version." \
+                "\n\nYou have either:"
+              unless specs_updated?
+                message << "\n * out-of-date source repos which you can update with `pod repo update` or with `pod install --repo-update`."
+              end
+              message << "\n * mistyped the name or version." \
                 "\n * not added the source repo that hosts the Podspec to your Podfile." \
                 "\n\nNote: as of CocoaPods 1.0, `pod repo update` does not happen on `pod install` by default."
 
@@ -439,7 +458,7 @@ module Pod
           end
         end
       end
-      raise Informative, message
+      raise type, message
     end
 
     # Returns whether the given spec is platform-compatible with the dependency

@@ -18,11 +18,11 @@ module Pod
           specification.respond_to?(method, include_all)
         end
 
-        def subspec_by_name(name = nil, raise_if_missing = true)
+        def subspec_by_name(name = nil, raise_if_missing = true, include_test_specifications = false)
           if !name || name == self.name
             self
           else
-            specification.subspec_by_name(name, raise_if_missing)
+            specification.subspec_by_name(name, raise_if_missing, include_test_specifications)
           end
         end
 
@@ -32,12 +32,12 @@ module Pod
       end
 
       class External
-        def all_specifications
+        def all_specifications(_warn_for_multiple_pod_sources)
           [specification]
         end
       end
 
-      def all_specifications
+      def all_specifications(warn_for_multiple_pod_sources)
         @all_specifications ||= begin
           sources_by_version = {}
           versions_by_source.each do |source, versions|
@@ -45,13 +45,15 @@ module Pod
             sources_by_version
           end
 
-          duplicate_versions = sources_by_version.select { |_version, sources| sources.count > 1 }
+          if warn_for_multiple_pod_sources
+            duplicate_versions = sources_by_version.select { |_version, sources| sources.count > 1 }
 
-          duplicate_versions.each do |version, sources|
-            UI.warn "Found multiple specifications for `#{name} (#{version})`:\n" +
-              sources.
-                map { |s| s.specification_path(name, version) }.
-                map { |v| "- #{v}" }.join("\n")
+            duplicate_versions.each do |version, sources|
+              UI.warn "Found multiple specifications for `#{name} (#{version})`:\n" +
+                sources.
+                  map { |s| s.specification_path(name, version) }.
+                  map { |v| "- #{v}" }.join("\n")
+            end
           end
 
           versions_by_source.flat_map do |source, versions|

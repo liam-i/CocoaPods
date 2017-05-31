@@ -8,11 +8,7 @@ git:
 
 matrix:
   include:
-  - rvm: system
-    env: COCOAPODS_CI_TASKS=EXAMPLES
-    osx_image: xcode7.3
-    language: objective-c
-  - rvm: 2.3.1
+  - rvm: 2.4.0
     env: COCOAPODS_CI_TASKS=LINT
     git:
       submodules: false
@@ -25,7 +21,7 @@ rvm:
   # OS X 10.9.0-10.9.2
   # TODO: currently unavailable: https://github.com/travis-ci/travis-ci/issues/2918
   # - 2.0.0-p247
-  - 2.3.1
+  - 2.4.0
 
 env:
   - COCOAPODS_CI_TASKS=SPECS
@@ -58,6 +54,8 @@ before_install:
 before_script:
   - git config --global user.email "tests@cocoapods.org"
   - git config --global user.name "CocoaPods Tests"
+  # Disable bundler version check mechanism, as it crashes, possibly due to https://github.com/bundler/bundler/commit/1e05d24050b4177e9a8001b7c1083d713b474faf
+  - bundle config disable_version_check true
   - bundle exec pod env
 
 script:

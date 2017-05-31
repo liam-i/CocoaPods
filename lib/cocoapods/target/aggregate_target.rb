@@ -9,7 +9,7 @@ module Pod
 
     # Product types where the product's frameworks must be embedded in a host target
     #
-    EMBED_FRAMEWORKS_IN_HOST_TARGET_TYPES = [:app_extension, :framework, :messages_extension, :watch_extension, :xpc_service].freeze
+    EMBED_FRAMEWORKS_IN_HOST_TARGET_TYPES = [:app_extension, :framework, :static_library, :messages_extension, :watch_extension, :xpc_service].freeze
 
     # Initialize a new instance
     #
@@ -25,6 +25,18 @@ module Pod
       @search_paths_aggregate_targets = []
       @file_accessors = []
       @xcconfigs = {}
+    end
+
+    # @return [Boolean] True if the user_target refers to a
+    #         library (framework, static or dynamic lib).
+    #
+    def library?
+      # Without a user_project, we can't say for sure
+      # that this is a library
+      return false if user_project.nil?
+      symbol_types = user_targets.map(&:symbol_type).uniq
+      raise ArgumentError, "Expected single kind of user_target for #{name}. Found #{symbol_types.join(', ')}." unless symbol_types.count == 1
+      [:framework, :dynamic_library, :static_library].include? symbol_types.first
     end
 
     # @return [Boolean] True if the user_target's pods are
@@ -202,6 +214,16 @@ module Pod
     #
     def relative_pods_root
       "${SRCROOT}/#{sandbox.root.relative_path_from(client_root)}"
+    end
+
+    # @return [String] The path of the Podfile directory relative to the
+    #         root of the user project.
+    #
+    def podfile_dir_relative_path
+      podfile_path = target_definition.podfile.defined_in_file
+      return "${SRCROOT}/#{podfile_path.relative_path_from(client_root).dirname}" unless podfile_path.nil?
+      # Fallback to the standard path if the Podfile is not represented by a file.
+      '${PODS_ROOT}/..'
     end
 
     # @param  [String] config_name The build configuration name to get the xcconfig for

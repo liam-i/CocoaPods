@@ -61,8 +61,8 @@ module Pod
             fi
 
             # use filter instead of exclude so missing patterns dont' throw errors
-            echo "rsync -av --filter \\"- CVS/\\" --filter \\"- .svn/\\" --filter \\"- .git/\\" --filter \\"- .hg/\\" --filter \\"- Headers\\" --filter \\"- PrivateHeaders\\" --filter \\"- Modules\\" \\"${source}\\" \\"${destination}\\""
-            rsync -av --filter "- CVS/" --filter "- .svn/" --filter "- .git/" --filter "- .hg/" --filter "- Headers" --filter "- PrivateHeaders" --filter "- Modules" "${source}" "${destination}"
+            echo "rsync --delete -av --filter \\"- CVS/\\" --filter \\"- .svn/\\" --filter \\"- .git/\\" --filter \\"- .hg/\\" --filter \\"- Headers\\" --filter \\"- PrivateHeaders\\" --filter \\"- Modules\\" \\"${source}\\" \\"${destination}\\""
+            rsync --delete -av --filter "- CVS/" --filter "- .svn/" --filter "- .git/" --filter "- .hg/" --filter "- Headers" --filter "- PrivateHeaders" --filter "- Modules" "${source}" "${destination}"
 
             local basename
             basename="$(basename -s .framework "$1")"
@@ -88,6 +88,15 @@ module Pod
                 rsync -auv "${SWIFT_STDLIB_PATH}/${lib}" "${destination}"
                 code_sign_if_enabled "${destination}/${lib}"
               done
+            fi
+          }
+
+          # Copies the dSYM of a vendored framework
+          install_dsym() {
+            local source="$1"
+            if [ -r "$source" ]; then
+              echo "rsync --delete -av --filter \\"- CVS/\\" --filter \\"- .svn/\\" --filter \\"- .git/\\" --filter \\"- .hg/\\" --filter \\"- Headers\\" --filter \\"- PrivateHeaders\\" --filter \\"- Modules\\" \\"${source}\\" \\"${DWARF_DSYM_FOLDER_PATH}\\""
+              rsync --delete -av --filter "- CVS/" --filter "- .svn/" --filter "- .git/" --filter "- .hg/" --filter "- Headers" --filter "- PrivateHeaders" --filter "- Modules" "${source}" "${DWARF_DSYM_FOLDER_PATH}"
             fi
           }
 
@@ -126,11 +135,14 @@ module Pod
 
         SH
         script << "\n" unless frameworks_by_config.values.all?(&:empty?)
-        frameworks_by_config.each do |config, frameworks|
-          unless frameworks.empty?
+        frameworks_by_config.each do |config, frameworks_with_dsyms|
+          unless frameworks_with_dsyms.empty?
             script << %(if [[ "$CONFIGURATION" == "#{config}" ]]; then\n)
-            frameworks.each do |framework|
-              script << %(  install_framework "#{framework}"\n)
+            frameworks_with_dsyms.each do |framework_with_dsym|
+              script << %(  install_framework "#{framework_with_dsym[:framework]}"\n)
+              # Vendored frameworks might have a dSYM file next to them so ensure its copied. Frameworks built from
+              # sources will have their dSYM generated and copied by Xcode.
+              script << %(  install_dsym "#{framework_with_dsym[:dSYM]}"\n) unless framework_with_dsym[:dSYM].nil?
             end
             script << "fi\n"
           end

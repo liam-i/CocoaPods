@@ -242,6 +242,55 @@ module Pod
 
           #--------------------------------------#
 
+          describe '#set_test_target_dependencies' do
+            before do
+              spec = fixture_spec('coconut-lib/CoconutLib.podspec')
+
+              target_definition = Podfile::TargetDefinition.new(:default, @installer.podfile.root_target_definitions.first)
+              @pod_target = PodTarget.new([spec, *spec.recursive_subspecs], [target_definition], config.sandbox)
+              @target = AggregateTarget.new(target_definition, config.sandbox)
+
+              @mock_target = mock('PodNativeTarget')
+
+              mock_project = mock('PodsProject', :frameworks_group => mock('FrameworksGroup'))
+              @generator.stubs(:project).returns(mock_project)
+
+              @target.stubs(:native_target).returns(@mock_target)
+              @target.stubs(:pod_targets).returns([@pod_target])
+              @generator.stubs(:aggregate_targets).returns([@target])
+            end
+
+            it 'adds test dependent targets to test native targets' do
+              mock_native_target = mock('CoconutLib')
+              mock_test_native_target = mock('CoconutLib-Unit-Tests')
+
+              dependent_native_target = mock('DependentNativeTarget')
+              test_dependent_native_target = mock('TestDependentNativeTarget')
+
+              dependent_target = mock('dependent-target', :should_build? => true, :native_target => dependent_native_target)
+              test_dependent_target = mock('dependent-test-target', :should_build? => true, :native_target => test_dependent_native_target)
+
+              @pod_target.stubs(:native_target).returns(mock_native_target)
+              @pod_target.stubs(:test_native_targets).returns([mock_test_native_target])
+              @pod_target.stubs(:dependent_targets).returns([dependent_target])
+              @pod_target.stubs(:test_dependent_targets).returns([test_dependent_target])
+              @pod_target.stubs(:should_build? => true)
+              @mock_target.expects(:add_dependency).with(mock_native_target)
+
+              mock_native_target.expects(:add_dependency).with(dependent_native_target)
+              mock_native_target.expects(:add_dependency).with(test_dependent_native_target).never
+              mock_native_target.expects(:add_dependency).with(mock_native_target).never
+
+              mock_test_native_target.expects(:add_dependency).with(dependent_native_target).never
+              mock_test_native_target.expects(:add_dependency).with(test_dependent_native_target)
+              mock_test_native_target.expects(:add_dependency).with(mock_native_target)
+
+              @generator.send(:set_target_dependencies)
+            end
+          end
+
+          #--------------------------------------#
+
           describe '#write' do
             before do
               @generator.stubs(:aggregate_targets).returns([])
@@ -300,6 +349,30 @@ module Pod
                 Xcodeproj::XCScheme.expects(:share_scheme).with(
                   @generator.project.path,
                   'BananaLib')
+                @generator.send(:share_development_pod_schemes)
+              end
+
+              it 'shares test schemes' do
+                spec = fixture_spec('coconut-lib/CoconutLib.podspec')
+                target_definition = Podfile::TargetDefinition.new(:default, @installer.podfile.root_target_definitions.first)
+                pod_target = Pod::PodTarget.new([spec, *spec.recursive_subspecs], [target_definition], config.sandbox)
+                pod_target.stubs(:should_build?).returns(true)
+
+                @generator.installation_options.
+                    stubs(:share_schemes_for_development_pods).
+                    returns(true)
+
+                @generator.stubs(:pod_targets).returns([pod_target])
+                @generator.sandbox.stubs(:development_pods).returns('CoconutLib' => nil)
+
+                Xcodeproj::XCScheme.expects(:share_scheme).with(
+                  @generator.project.path,
+                  'CoconutLib')
+
+                Xcodeproj::XCScheme.expects(:share_scheme).with(
+                  @generator.project.path,
+                  'CoconutLib-Unit-Tests')
+
                 @generator.send(:share_development_pod_schemes)
               end
 

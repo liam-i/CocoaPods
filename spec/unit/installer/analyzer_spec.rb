@@ -67,7 +67,7 @@ module Pod
 
       it 'does not update unused sources' do
         @analyzer.stubs(:sources).returns(config.sources_manager.master)
-        config.sources_manager.expects(:update).once.with('master')
+        config.sources_manager.expects(:update).once.with('master', true)
         @analyzer.update_repositories
       end
 
@@ -124,7 +124,7 @@ module Pod
         source.stubs(:repo).returns('/repo/cache/path')
         config.sources_manager.expects(:find_or_create_source_with_url).with(repo_url).returns(source)
         source.stubs(:git?).returns(true)
-        config.sources_manager.expects(:update).once.with(source.name)
+        config.sources_manager.expects(:update).once.with(source.name, true)
 
         analyzer = Pod::Installer::Analyzer.new(config.sandbox, podfile, nil)
         analyzer.update_repositories
@@ -662,46 +662,27 @@ module Pod
         should.raise(Informative) { analyzer.analyze }
       end
 
-      it 'raises when targets integrate the same swift pod but have different swift versions' do
-        podfile = Podfile.new do
-          source SpecHelper.test_repo_url
-          project 'SampleProject/SampleProject'
-          platform :ios, '8.0'
-          pod 'OrangeFramework'
-          target 'SampleProject'
-          target 'TestRunner'
-        end
-        podfile.target_definitions['SampleProject'].stubs(:swift_version).returns('3.0')
-        podfile.target_definitions['TestRunner'].stubs(:swift_version).returns('2.3')
-        analyzer = Pod::Installer::Analyzer.new(config.sandbox, podfile)
-
-        should.raise Informative do
-          analyzer.analyze
-        end.message.should.match /The following pods are integrated into targets that do not have the same Swift version:/
-      end
-
-      it 'does not raise when targets integrate the same pod but only one of the targets is a swift target' do
-        podfile = Podfile.new do
-          source SpecHelper.test_repo_url
-          project 'SampleProject/SampleProject'
-          platform :ios, '8.0'
-          pod 'OrangeFramework'
-          target 'SampleProject'
-          target 'TestRunner'
-        end
-        podfile.target_definitions['SampleProject'].stubs(:swift_version).returns('3.0')
-        # when the swift version is unset at the project level, but set in one target, swift_version is nil
-        podfile.target_definitions['TestRunner'].stubs(:swift_version).returns(nil)
-        analyzer = Pod::Installer::Analyzer.new(config.sandbox, podfile)
-        lambda { analyzer.analyze }.should.not.raise
-      end
-
       #--------------------------------------#
 
       it 'computes the state of the Sandbox respect to the resolved dependencies' do
         @analyzer.stubs(:lockfile).returns(nil)
         state = @analyzer.analyze.sandbox_state
         state.added.sort.should == %w(AFNetworking JSONKit SVPullToRefresh libextobjc)
+      end
+
+      #-------------------------------------------------------------------------#
+
+      it 'handles test only pod targets' do
+        pod_target_one = stub(:name => 'Pod1', :dependent_targets => [], :test_dependent_targets => [])
+        pod_target_two = stub(:name => 'Pod2', :dependent_targets => [], :test_dependent_targets => [])
+        pod_target_three = stub(:name => 'Pod3', :dependent_targets => [pod_target_one, pod_target_two], :test_dependent_targets => [])
+        pod_target_four = stub(:name => 'Pod4', :dependent_targets => [], :test_dependent_targets => [pod_target_three])
+
+        all_pod_targets = [pod_target_one, pod_target_two, pod_target_three, pod_target_four]
+        @analyzer.send(:pod_target_test_only?, pod_target_one, all_pod_targets).should.be.false
+        @analyzer.send(:pod_target_test_only?, pod_target_two, all_pod_targets).should.be.false
+        @analyzer.send(:pod_target_test_only?, pod_target_three, all_pod_targets).should.be.true
+        @analyzer.send(:pod_target_test_only?, pod_target_four, all_pod_targets).should.be.false
       end
 
       #-------------------------------------------------------------------------#
@@ -757,7 +738,31 @@ module Pod
               pod 'JSONKit'
             end
 
-            target 'Sample Framework' do
+            target 'SampleFramework' do
+              project 'SampleProject/Sample Lib/Sample Lib'
+              pod 'monkey'
+            end
+          end
+          analyzer = Pod::Installer::Analyzer.new(config.sandbox, podfile)
+          result = analyzer.analyze
+
+          result.targets.select { |at| at.name == 'Pods-SampleProject' }.flat_map(&:pod_targets).map(&:name).sort.uniq.should == %w(
+            JSONKit
+            monkey
+          ).sort
+        end
+
+        it "copy a static library's pod target, when the static library is in a sub project" do
+          podfile = Pod::Podfile.new do
+            source SpecHelper.test_repo_url
+            platform :ios, '8.0'
+            project 'SampleProject/SampleProject'
+
+            target 'SampleProject' do
+              pod 'JSONKit'
+            end
+
+            target 'SampleLib' do
               project 'SampleProject/Sample Lib/Sample Lib'
               pod 'monkey'
             end
@@ -793,14 +798,29 @@ module Pod
             source SpecHelper.test_repo_url
             use_frameworks!
             platform :ios, '8.0'
-            target 'Sample Framework' do
+            target 'SampleLib' do
               project 'SampleProject/Sample Lib/Sample Lib'
               pod 'monkey'
             end
           end
           analyzer = Pod::Installer::Analyzer.new(config.sandbox, podfile)
           analyzer.analyze
-          UI.warnings.should.match /The Podfile contains framework targets, for which the Podfile does not contain host targets \(targets which embed the framework\)\./
+          UI.warnings.should.match /The Podfile contains framework or static library targets, for which the Podfile does not contain host targets \(targets which embed the framework\)\./
+        end
+
+        it 'warns when using a Podfile for framework-only projects' do
+          podfile = Pod::Podfile.new do
+            source SpecHelper.test_repo_url
+            use_frameworks!
+            platform :ios, '8.0'
+            target 'SampleFramework' do
+              project 'SampleProject/Sample Lib/Sample Lib'
+              pod 'monkey'
+            end
+          end
+          analyzer = Pod::Installer::Analyzer.new(config.sandbox, podfile)
+          analyzer.analyze
+          UI.warnings.should.match /The Podfile contains framework or static library targets, for which the Podfile does not contain host targets \(targets which embed the framework\)\./
         end
 
         it 'raises when the extension calls use_frameworks!, but the host target does not' do
@@ -822,51 +842,6 @@ module Pod
           should.raise Informative do
             analyzer.analyze
           end.message.should.match /Sample Extensions Project \(false\) and Today Extension \(true\) do not both set use_frameworks!\./
-        end
-
-        it 'raises when the extension and host target use different swift versions' do
-          podfile = Pod::Podfile.new do
-            source SpecHelper.test_repo_url
-            platform :ios, '8.0'
-            use_frameworks!
-            project 'Sample Extensions Project/Sample Extensions Project'
-
-            target 'Sample Extensions Project' do
-              pod 'JSONKit', '1.4'
-            end
-
-            target 'Today Extension' do
-              pod 'monkey'
-            end
-          end
-          podfile.target_definitions['Sample Extensions Project'].stubs(:swift_version).returns('2.3')
-          podfile.target_definitions['Today Extension'].stubs(:swift_version).returns('3.0')
-          analyzer = Pod::Installer::Analyzer.new(config.sandbox, podfile)
-          should.raise Informative do
-            analyzer.analyze
-          end.message.should.match /Sample Extensions Project \(2\.3\) and Today Extension \(3\.0\) do not use the same Swift version\./
-        end
-
-        it 'raises when the extension and host target use different platforms' do
-          podfile = Pod::Podfile.new do
-            source SpecHelper.test_repo_url
-            platform :ios, '8.0'
-            use_frameworks!
-            project 'Sample Extensions Project/Sample Extensions Project'
-
-            target 'Sample Extensions Project' do
-              pod 'JSONKit', '1.4'
-            end
-
-            target 'Today Extension' do
-              pod 'monkey'
-            end
-          end
-          podfile.target_definitions['Sample Extensions Project'].stubs(:platform).returns(Platform.new(:osx, '10.6'))
-          analyzer = Pod::Installer::Analyzer.new(config.sandbox, podfile)
-          should.raise Informative do
-            analyzer.analyze
-          end.message.should.match /Sample Extensions Project \(OS X 10\.6\) and Today Extension \(iOS 8\.0\) do not use the same platform\./
         end
       end
 

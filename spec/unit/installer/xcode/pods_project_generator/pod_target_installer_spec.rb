@@ -139,6 +139,109 @@ module Pod
               end
             end
 
+            describe 'test target generation' do
+              before do
+                config.sandbox.prepare
+                @podfile = Podfile.new do
+                  platform :ios, '6.0'
+                  project 'SampleProject/SampleProject'
+                  target 'SampleProject'
+                end
+                @target_definition = @podfile.target_definitions['SampleProject']
+                @project = Project.new(config.sandbox.project_path)
+                config.sandbox.project = @project
+
+                @coconut_spec = fixture_spec('coconut-lib/CoconutLib.podspec')
+
+                # Add sources to the project.
+                file_accessor = Sandbox::FileAccessor.new(Sandbox::PathList.new(fixture('coconut-lib')), @coconut_spec.consumer(:ios))
+                @project.add_pod_group('CoconutLib', fixture('coconut-lib'))
+                group = @project.group_for_spec('CoconutLib')
+                file_accessor.source_files.each do |file|
+                  @project.add_file_reference(file, group)
+                end
+                file_accessor.resources.each do |resource|
+                  @project.add_file_reference(resource, group)
+                end
+
+                # Add test sources to the project.
+                test_file_accessor = Sandbox::FileAccessor.new(Sandbox::PathList.new(fixture('coconut-lib')), @coconut_spec.test_specs.first.consumer(:ios))
+                @project.add_pod_group('CoconutLibTests', fixture('coconut-lib'))
+                group = @project.group_for_spec('CoconutLibTests')
+                test_file_accessor.source_files.each do |file|
+                  @project.add_file_reference(file, group)
+                end
+                test_file_accessor.resources.each do |resource|
+                  @project.add_file_reference(resource, group)
+                end
+
+                @coconut_pod_target = PodTarget.new([@coconut_spec, *@coconut_spec.recursive_subspecs], [@target_definition], config.sandbox)
+                @coconut_pod_target.file_accessors = [file_accessor, test_file_accessor]
+                @coconut_pod_target.user_build_configurations = { 'Debug' => :debug, 'Release' => :release }
+                @installer = PodTargetInstaller.new(config.sandbox, @coconut_pod_target)
+              end
+
+              it 'adds the native test target to the project' do
+                @installer.install!
+                @project.targets.count.should == 2
+                @project.targets.first.name.should == 'CoconutLib'
+                native_test_target = @project.targets[1]
+                native_test_target.name.should == 'CoconutLib-Unit-Tests'
+                native_test_target.product_reference.name.should == 'CoconutLib-Unit-Tests'
+                native_test_target.symbol_type.should == :unit_test_bundle
+                @coconut_pod_target.test_native_targets.count.should == 1
+              end
+
+              it 'adds files to build phases correctly depending on the native target' do
+                @installer.install!
+                @project.targets.count.should == 2
+                native_target = @project.targets[0]
+                native_target.source_build_phase.files.count.should == 2
+                native_target.source_build_phase.files.map(&:display_name).sort.should == [
+                  'Coconut.m',
+                  'CoconutLib-dummy.m',
+                ]
+                native_test_target = @project.targets[1]
+                native_test_target.source_build_phase.files.count.should == 1
+                native_test_target.source_build_phase.files.map(&:display_name).sort.should == [
+                  'CoconutTests.m',
+                ]
+              end
+
+              it 'adds xcconfig file reference for test native targets' do
+                @installer.install!
+                @project.support_files_group
+                group = @project['Pods/CoconutLib/Support Files']
+                group.children.map(&:display_name).sort.should.include 'CoconutLib.unit.xcconfig'
+              end
+
+              it 'does not add test header imports to umbrella header' do
+                @coconut_pod_target.stubs(:requires_frameworks?).returns(true)
+                @installer.install!
+                content = @coconut_pod_target.umbrella_header_path.read
+                content.should.not =~ /"CoconutTestHeader.h"/
+              end
+
+              it 'returns the correct native target based on the consumer provided' do
+                @installer.install!
+                native_target = @installer.send(:native_target_for_consumer, @coconut_spec.consumer(:ios))
+                native_target.name.should == 'CoconutLib'
+                native_target.product_reference.name.should == 'libCoconutLib.a'
+                test_native_target = @installer.send(:native_target_for_consumer, @coconut_spec.test_specs.first.consumer(:ios))
+                test_native_target.name.should == 'CoconutLib-Unit-Tests'
+                test_native_target.product_reference.name.should == 'CoconutLib-Unit-Tests'
+              end
+
+              it 'returns the correct product type for test type' do
+                @installer.send(:product_type_for_test_type, :unit).should == :unit_test_bundle
+              end
+
+              it 'raises for unknown test type' do
+                exception = lambda { @installer.send(:product_type_for_test_type, :weird_test_type) }.should.raise Informative
+                exception.message.should.include 'Unknown test type passed `weird_test_type`.'
+              end
+            end
+
             #--------------------------------------#
 
             it 'adds the source files of each pod to the target of the Pod library' do
@@ -545,6 +648,66 @@ module Pod
               end
             end
 
+            describe 'concerning resources' do
+              before do
+                config.sandbox.prepare
+
+                @project = Project.new(config.sandbox.project_path)
+
+                config.sandbox.project = @project
+
+                @spec = fixture_spec('banana-lib/BananaLib.podspec')
+                @spec.resources = ['Resources/**/*']
+                @spec.resource_bundle = nil
+                @project.add_pod_group('BananaLib', fixture('banana-lib'))
+
+                @pod_target = fixture_pod_target(@spec)
+                @pod_target.stubs(:requires_frameworks? => true)
+                @pod_target.user_build_configurations = { 'Debug' => :debug, 'Release' => :release }
+                target_installer = PodTargetInstaller.new(config.sandbox, @pod_target)
+
+                # Use a file references installer to add the files so that the correct ones are added.
+                file_ref_installer = Installer::Xcode::PodsProjectGenerator::FileReferencesInstaller.new(config.sandbox, [@pod_target], @project)
+                file_ref_installer.install!
+
+                target_installer.install!
+              end
+
+              it 'adds variant groups directly to resources' do
+                native_target = @project.targets.first
+
+                # The variant group item should be present.
+                group_build_file = native_target.resources_build_phase.files.find do |bf|
+                  bf.file_ref.path == 'Resources' && bf.file_ref.name == 'Main.storyboard'
+                end
+
+                group_build_file.should.be.not.nil
+                group_build_file.file_ref.is_a?(Xcodeproj::Project::Object::PBXVariantGroup).should.be.true
+
+                # An item within the variant group should not be present.
+                strings_build_file = native_target.resources_build_phase.files.find do |bf|
+                  bf.file_ref.path == 'Resources/en.lproj/Main.strings'
+                end
+                strings_build_file.should.be.nil
+              end
+
+              it 'adds Core Data models to the compile sources phase (non-bundles only)' do
+                native_target = @project.targets.first
+
+                # The data model should not be in the resources phase.
+                core_data_resources_file = native_target.resources_build_phase.files.find do |bf|
+                  bf.file_ref.path == 'Resources/Sample.xcdatamodeld'
+                end
+                core_data_resources_file.should.be.nil
+
+                # The data model should not be in the resources phase.
+                core_data_sources_file = native_target.source_build_phase.files.find do |bf|
+                  bf.file_ref.path == 'Resources/Sample.xcdatamodeld'
+                end
+                core_data_sources_file.should.be.not.nil
+              end
+            end
+
             describe 'concerning resource bundles' do
               before do
                 config.sandbox.prepare
@@ -572,7 +735,7 @@ module Pod
                 @bundle_target.should.be.not.nil
               end
 
-              it 'adds variant groups directly to resources' do
+              it 'adds variant groups directly to resource bundle' do
                 # The variant group item should be present.
                 group_build_file = @bundle_target.resources_build_phase.files.find do |bf|
                   bf.file_ref.path == 'Resources' && bf.file_ref.name == 'Main.storyboard'
@@ -587,7 +750,7 @@ module Pod
                 strings_build_file.should.be.nil
               end
 
-              it 'adds Core Data models directly to resources' do
+              it 'adds Core Data models directly to resource bundle' do
                 # The model directory item should be present.
                 dir_build_file = @bundle_target.resources_build_phase.files.find { |bf| bf.file_ref.path == 'Resources/Sample.xcdatamodeld' }
                 dir_build_file.should.be.not.nil
