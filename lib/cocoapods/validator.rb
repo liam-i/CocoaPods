@@ -14,6 +14,14 @@ module Pod
   class Validator
     include Config::Mixin
 
+    # The default version of Swift to use when linting pods
+    #
+    DEFAULT_SWIFT_VERSION = '4.0'.freeze
+
+    # The valid platforms for linting
+    #
+    VALID_PLATFORMS = Platform.all.freeze
+
     # @return [Specification::Linter] the linter instance from CocoaPods
     #         Core.
     #
@@ -27,13 +35,30 @@ module Pod
     # @param  [Array<String>] source_urls
     #         the Source URLs to use in creating a {Podfile}.
     #
-    def initialize(spec_or_path, source_urls)
+    # @param  [Array<String>] platforms
+    #         the platforms to lint.
+    #
+    def initialize(spec_or_path, source_urls, platforms = [])
+      @use_frameworks = true
       @linter = Specification::Linter.new(spec_or_path)
-      @source_urls = if @linter.spec && @linter.spec.dependencies.empty?
+      @source_urls = if @linter.spec && @linter.spec.dependencies.empty? && @linter.spec.recursive_subspecs.all? { |s| s.dependencies.empty? }
                        []
                      else
                        source_urls.map { |url| config.sources_manager.source_with_name_or_url(url) }.map(&:url)
                      end
+
+      @platforms = platforms.map do |platform|
+        result =  case platform.to_s.downcase
+                  # Platform doesn't recognize 'macos' as being the same as 'osx' when initializing
+                  when 'macos' then Platform.macos
+                  else Platform.new(platform, nil)
+                  end
+        unless valid_platform?(result)
+          raise Informative, "Unrecognized platform `#{platform}`. Valid platforms: #{VALID_PLATFORMS.join(', ')}"
+        end
+        result
+      end
+      @use_frameworks = true
     end
 
     #-------------------------------------------------------------------------#
@@ -51,6 +76,28 @@ module Pod
       @linter.file
     end
 
+    # Returns a list of platforms to lint for a given Specification
+    #
+    # @param [Specification] spec
+    #         The specification to lint
+    #
+    # @return [Array<Platform>] platforms to lint for the given specification
+    #
+    def platforms_to_lint(spec)
+      return spec.available_platforms if @platforms.empty?
+
+      # Validate that the platforms specified are actually supported by the spec
+      results = @platforms.map do |platform|
+        matching_platform = spec.available_platforms.find { |p| p.name == platform.name }
+        unless matching_platform
+          raise Informative, "Platform `#{platform}` is not supported by specification `#{spec}`."
+        end
+        matching_platform
+      end.uniq
+
+      results
+    end
+
     # @return [Sandbox::FileAccessor] the file accessor for the spec.
     #
     attr_accessor :file_accessor
@@ -63,7 +110,7 @@ module Pod
     # @note   This method shows immediately which pod is being processed and
     #         overrides the printed line once the result is known.
     #
-    # @return [Bool] whether the specification passed validation.
+    # @return [Boolean] whether the specification passed validation.
     #
     def validate
       @results = []
@@ -71,8 +118,8 @@ module Pod
       # Replace default spec with a subspec if asked for
       a_spec = spec
       if spec && @only_subspec
-        subspec_name = @only_subspec.start_with?(spec.root.name) ? @only_subspec : "#{spec.root.name}/#{@only_subspec}"
-        a_spec = spec.subspec_by_name(subspec_name)
+        subspec_name = @only_subspec.start_with?("#{spec.root.name}/") ? @only_subspec : "#{spec.root.name}/#{@only_subspec}"
+        a_spec = spec.subspec_by_name(subspec_name, true, true)
         @subspec_name = a_spec.name
       end
 
@@ -152,25 +199,25 @@ module Pod
 
     #-------------------------------------------------------------------------#
 
-    #  @!group Configuration
+    #  @!group Configuration
 
-    # @return [Bool] whether the validation should skip the checks that
+    # @return [Boolean] whether the validation should skip the checks that
     #         requires the download of the library.
     #
     attr_accessor :quick
 
-    # @return [Bool] whether the linter should not clean up temporary files
+    # @return [Boolean] whether the linter should not clean up temporary files
     #         for inspection.
     #
     attr_accessor :no_clean
 
-    # @return [Bool] whether the linter should fail as soon as the first build
+    # @return [Boolean] whether the linter should fail as soon as the first build
     #         variant causes an error. Helpful for i.e. multi-platforms specs,
     #         specs with subspecs.
     #
     attr_accessor :fail_fast
 
-    # @return [Bool] whether the validation should be performed against the root of
+    # @return [Boolean] whether the validation should be performed against the root of
     #         the podspec instead to its original source.
     #
     # @note   Uses the `:path` option of the Podfile.
@@ -178,7 +225,7 @@ module Pod
     attr_accessor :local
     alias_method :local?, :local
 
-    # @return [Bool] Whether the validator should fail on warnings, or only on errors.
+    # @return [Boolean] Whether the validator should fail on warnings, or only on errors.
     #
     attr_accessor :allow_warnings
 
@@ -186,21 +233,53 @@ module Pod
     #
     attr_accessor :only_subspec
 
-    # @return [Bool] Whether the validator should validate all subspecs
+    # @return [Boolean] Whether the validator should validate all subspecs.
     #
     attr_accessor :no_subspecs
 
-    # @return [Bool] Whether frameworks should be used for the installation.
+    # @return [Boolean] Whether the validator should skip building and running tests.
+    #
+    attr_accessor :skip_tests
+
+    # @return [Array<String>] List of test_specs to run. If nil, all tests are run (unless skip_tests is specified).
+    #
+    attr_accessor :test_specs
+
+    # @return [Boolean] Whether the validator should run Xcode Static Analysis.
+    #
+    attr_accessor :analyze
+
+    # @return [Boolean] Whether frameworks should be used for the installation.
     #
     attr_accessor :use_frameworks
+
+    # @return [Boolean] Whether modular headers should be used for the installation.
+    #
+    attr_accessor :use_modular_headers
+
+    # @return [Boolean] Whether static frameworks should be used for the installation.
+    #
+    attr_accessor :use_static_frameworks
 
     # @return [Boolean] Whether attributes that affect only public sources
     #         Bool be skipped.
     #
     attr_accessor :ignore_public_only_results
 
+    # @return [String] A glob for podspecs to be used during building of
+    #         the local Podfile via :path.
+    #
+    attr_accessor :include_podspecs
+
+    # @return [String] A glob for podspecs to be used during building of
+    #         the local Podfile via :podspec.
+    #
+    attr_accessor :external_podspecs
+
     attr_accessor :skip_import_validation
     alias_method :skip_import_validation?, :skip_import_validation
+
+    attr_accessor :configuration
 
     #-------------------------------------------------------------------------#
 
@@ -245,17 +324,12 @@ module Pod
       @validation_dir ||= Pathname(Dir.mktmpdir(['CocoaPods-Lint-', "-#{spec.name}"]))
     end
 
-    # @return [String] the SWIFT_VERSION to use for validation.
+    # @return [String] The SWIFT_VERSION that should be used to validate the pod. This is set by passing the
+    # `--swift-version` parameter during validation.
     #
-    def swift_version
-      @swift_version ||= dot_swift_version || '3.0'
-    end
+    attr_accessor :swift_version
 
-    # Set the SWIFT_VERSION that should be used to validate the pod.
-    #
-    attr_writer :swift_version
-
-    # @return [String] the SWIFT_VERSION in the .swift-version file or nil.
+    # @return [String] the SWIFT_VERSION within the .swift-version file or nil.
     #
     def dot_swift_version
       return unless file
@@ -264,11 +338,28 @@ module Pod
       swift_version_path.read.strip
     end
 
-    # @return [String] A string representing the Swift version used during linting
-    #                  or nil, if Swift was not used.
+    # @return [String] The derived Swift version to use for validation. The order of precedence is as follows:
+    #         - The `--swift-version` parameter is always checked first and honored if passed.
+    #         - The `swift_versions` DSL attribute within the podspec, in which case the latest version is always chosen.
+    #         - The Swift version within the `.swift-version` file if present.
+    #         - If none of the above are set then the `#DEFAULT_SWIFT_VERSION` is used.
     #
-    def used_swift_version
-      swift_version if @installer.pod_targets.any?(&:uses_swift?)
+    def derived_swift_version
+      @derived_swift_version ||= begin
+        if !swift_version.nil?
+          swift_version
+        elsif version = spec.swift_versions.max || dot_swift_version
+          version.to_s
+        else
+          DEFAULT_SWIFT_VERSION
+        end
+      end
+    end
+
+    # @return [Boolean] Whether any of the pod targets part of this validator use Swift or not.
+    #
+    def uses_swift?
+      @installer.pod_targets.any?(&:uses_swift?)
     end
 
     #-------------------------------------------------------------------------#
@@ -287,12 +378,19 @@ module Pod
     # Perform analysis for a given spec (or subspec)
     #
     def perform_extensive_analysis(spec)
+      if spec.non_library_specification?
+        error('spec', "Validating a non library spec (`#{spec.name}`) is not supported.")
+        return false
+      end
       validate_homepage(spec)
       validate_screenshots(spec)
       validate_social_media_url(spec)
       validate_documentation_url(spec)
+      validate_source_url(spec)
 
-      valid = spec.available_platforms.send(fail_fast ? :all? : :each) do |platform|
+      platforms = platforms_to_lint(spec)
+
+      valid = platforms.send(fail_fast ? :all? : :each) do |platform|
         UI.message "\n\n#{spec} - Analyzing on #{platform} platform.".green.reversed
         @consumer = spec.consumer(platform)
         setup_validation_environment
@@ -301,10 +399,11 @@ module Pod
           download_pod
           check_file_patterns
           install_pod
-          validate_dot_swift_version
+          validate_swift_version
           add_app_project_import
           validate_vendored_dynamic_frameworks
           build_pod
+          test_pod unless skip_tests
         ensure
           tear_down_validation_environment
         end
@@ -322,24 +421,29 @@ module Pod
     # Recursively perform the extensive analysis on all subspecs
     #
     def perform_extensive_subspec_analysis(spec)
-      spec.subspecs.send(fail_fast ? :all? : :each) do |subspec|
+      spec.subspecs.reject(&:non_library_specification?).send(fail_fast ? :all? : :each) do |subspec|
         @subspec_name = subspec.name
         perform_extensive_analysis(subspec)
       end
     end
 
+    # @return [Consumer] the consumer for the current platform being validated
+    #
     attr_accessor :consumer
+
+    # @return [String, Nil] the name of the current subspec being validated, or nil if none
+    #
     attr_accessor :subspec_name
 
     # Performs validation of a URL
     #
-    def validate_url(url)
-      resp = Pod::HTTP.validate_url(url)
+    def validate_url(url, user_agent = nil)
+      resp = Pod::HTTP.validate_url(url, user_agent)
 
       if !resp
         warning('url', "There was a problem validating the URL #{url}.", true)
       elsif !resp.success?
-        warning('url', "The URL (#{url}) is not reachable.", true)
+        note('url', "The URL (#{url}) is not reachable.", true)
       end
 
       resp
@@ -367,7 +471,7 @@ module Pod
     # Performs validations related to the `social_media_url` attribute.
     #
     def validate_social_media_url(spec)
-      validate_url(spec.social_media_url) if spec.social_media_url
+      validate_url(spec.social_media_url, 'CocoaPods') if spec.social_media_url
     end
 
     # Performs validations related to the `documentation_url` attribute.
@@ -376,14 +480,62 @@ module Pod
       validate_url(spec.documentation_url) if spec.documentation_url
     end
 
-    def validate_dot_swift_version
-      if !used_swift_version.nil? && dot_swift_version.nil?
-        warning(:swift_version,
-                'The validator for Swift projects uses ' \
-                'Swift 3.0 by default, if you are using a different version of ' \
-                'swift you can use a `.swift-version` file to set the version for ' \
-                "your Pod. For example to use Swift 2.3, run: \n" \
-                '    `echo "2.3" > .swift-version`')
+    # Performs validations related to the `source` -> `http` attribute (if exists)
+    #
+    def validate_source_url(spec)
+      return if spec.source.nil? || spec.source[:http].nil?
+      url = URI(spec.source[:http])
+      return if url.scheme == 'https' || url.scheme == 'file'
+      warning('http', "The URL (`#{url}`) doesn't use the encrypted HTTPS protocol. " \
+              'It is crucial for Pods to be transferred over a secure protocol to protect your users from man-in-the-middle attacks. '\
+              'This will be an error in future releases. Please update the URL to use https.')
+    end
+
+    # Performs validation for the version of Swift used during validation.
+    #
+    # An error will be displayed if the user has provided a `swift_versions` attribute within the podspec but is also
+    # using either `--swift-version` parameter or a `.swift-version` file with a Swift version that is not declared
+    # within the attribute.
+    #
+    # The user will be warned that the default version of Swift was used if the following things are true:
+    #   - The project uses Swift at all
+    #   - The user did not supply a Swift version via a parameter
+    #   - There is no `swift_versions` attribute set within the specification
+    #   - There is no `.swift-version` file present either.
+    #
+    def validate_swift_version
+      return unless uses_swift?
+      spec_swift_versions = spec.swift_versions.map(&:to_s)
+
+      unless spec_swift_versions.empty?
+        message = nil
+        if !dot_swift_version.nil? && !spec_swift_versions.include?(dot_swift_version)
+          message = "Specification `#{spec.name}` specifies inconsistent `swift_versions` (#{spec_swift_versions.map { |s| "`#{s}`" }.to_sentence}) compared to the one present in your `.swift-version` file (`#{dot_swift_version}`). " \
+                    'Please remove the `.swift-version` file which is now deprecated and only use the `swift_versions` attribute within your podspec.'
+        elsif !swift_version.nil? && !spec_swift_versions.include?(swift_version)
+          message = "Specification `#{spec.name}` specifies inconsistent `swift_versions` (#{spec_swift_versions.map { |s| "`#{s}`" }.to_sentence}) compared to the one passed during lint (`#{swift_version}`)."
+        end
+        unless message.nil?
+          error('swift', message)
+          return
+        end
+      end
+
+      if swift_version.nil? && spec.swift_versions.empty?
+        if !dot_swift_version.nil?
+          # The user will be warned to delete the `.swift-version` file in favor of the `swift_versions` DSL attribute.
+          # This is intentionally not a lint warning since we do not want to break existing setups and instead just soft
+          # deprecate this slowly.
+          #
+          UI.warn 'Usage of the `.swift_version` file has been deprecated! Please delete the file and use the ' \
+            "`swift_versions` attribute within your podspec instead.\n".yellow
+        else
+          warning('swift',
+                  'The validator used ' \
+                  "Swift `#{DEFAULT_SWIFT_VERSION}` by default because no Swift version was specified. " \
+                  'To specify a Swift version during validation, add the `swift_versions` attribute in your podspec. ' \
+                  'Note that usage of a `.swift-version` file is now deprecated.')
+        end
       end
     end
 
@@ -396,10 +548,16 @@ module Pod
     end
 
     def tear_down_validation_environment
-      validation_dir.rmtree unless no_clean
+      clean! unless no_clean
       Config.instance = @original_config
     end
 
+    def clean!
+      validation_dir.rmtree
+    end
+
+    # @return [String] The deployment targret of the library spec.
+    #
     def deployment_target
       deployment_target = spec.subspec_by_name(subspec_name).deployment_target(consumer.platform_name)
       if consumer.platform_name == :ios && use_frameworks
@@ -410,80 +568,58 @@ module Pod
     end
 
     def download_pod
-      podfile = podfile_from_spec(consumer.platform_name, deployment_target, use_frameworks)
+      test_spec_names = consumer.spec.test_specs.select { |ts| ts.supported_on_platform?(consumer.platform_name) }.map(&:name)
+      podfile = podfile_from_spec(consumer.platform_name, deployment_target, use_frameworks, test_spec_names, use_modular_headers, use_static_frameworks)
       sandbox = Sandbox.new(config.sandbox_root)
       @installer = Installer.new(sandbox, podfile)
       @installer.use_default_plugins = false
       @installer.has_dependencies = !spec.dependencies.empty?
-      %i(prepare resolve_dependencies download_dependencies).each { |m| @installer.send(m) }
+      %i(prepare resolve_dependencies download_dependencies write_lockfiles).each { |m| @installer.send(m) }
       @file_accessor = @installer.pod_targets.flat_map(&:file_accessors).find { |fa| fa.spec.name == consumer.spec.name }
     end
 
     def create_app_project
       app_project = Xcodeproj::Project.new(validation_dir + 'App.xcodeproj')
-      app_project.new_target(:application, 'App', consumer.platform_name, deployment_target)
+      app_target = Pod::Generator::AppTargetHelper.add_app_target(app_project, consumer.platform_name, deployment_target)
+      sandbox = Sandbox.new(config.sandbox_root)
+      info_plist_path = app_project.path.dirname.+('App/App-Info.plist')
+      Pod::Installer::Xcode::PodsProjectGenerator::TargetInstallerHelper.create_info_plist_file_with_sandbox(sandbox,
+                                                                                                             info_plist_path,
+                                                                                                             app_target,
+                                                                                                             '1.0.0',
+                                                                                                             Platform.new(consumer.platform_name),
+                                                                                                             :appl,
+                                                                                                             :build_setting_value => '$(SRCROOT)/App/App-Info.plist')
+      Pod::Generator::AppTargetHelper.add_swift_version(app_target, derived_swift_version)
+      app_target.build_configurations.each do |config|
+        # Lint will fail if a AppIcon is set but no image is found with such name
+        # Happens only with Static Frameworks enabled but shouldn't be set anyway
+        config.build_settings.delete('ASSETCATALOG_COMPILER_APPICON_NAME')
+        # Ensure this is set generally but we have seen an issue with ODRs:
+        # see: https://github.com/CocoaPods/CocoaPods/issues/10933
+        config.build_settings['PRODUCT_BUNDLE_IDENTIFIER'] = 'org.cocoapods.${PRODUCT_NAME:rfc1034identifier}'
+      end
       app_project.save
       app_project.recreate_user_schemes
     end
 
     def add_app_project_import
       app_project = Xcodeproj::Project.open(validation_dir + 'App.xcodeproj')
-      pod_target = @installer.pod_targets.find { |pt| pt.pod_name == spec.root.name }
-
-      source_file = write_app_import_source_file(pod_target)
-      source_file_ref = app_project.new_group('App', 'App').new_file(source_file)
       app_target = app_project.targets.first
-      app_target.add_file_references([source_file_ref])
-      add_swift_version(app_target)
-      add_xctest(app_target) if @installer.pod_targets.any? { |pt| pt.spec_consumers.any? { |c| c.frameworks.include?('XCTest') } }
+      pod_target = validation_pod_target
+      Pod::Generator::AppTargetHelper.add_app_project_import(app_project, app_target, pod_target, consumer.platform_name)
+      Pod::Generator::AppTargetHelper.add_xctest_search_paths(app_target) if @installer.pod_targets.any? { |pt| pt.spec_consumers.any? { |c| c.frameworks.include?('XCTest') || c.weak_frameworks.include?('XCTest') } }
+      Pod::Generator::AppTargetHelper.add_empty_swift_file(app_project, app_target) if @installer.pod_targets.any?(&:uses_swift?)
       app_project.save
       Xcodeproj::XCScheme.share_scheme(app_project.path, 'App')
       # Share the pods xcscheme only if it exists. For pre-built vendored pods there is no xcscheme generated.
       Xcodeproj::XCScheme.share_scheme(@installer.pods_project.path, pod_target.label) if shares_pod_target_xcscheme?(pod_target)
     end
 
-    def add_swift_version(app_target)
-      app_target.build_configurations.each do |configuration|
-        configuration.build_settings['SWIFT_VERSION'] = swift_version
-      end
-    end
-
-    def add_xctest(app_target)
-      app_target.build_configurations.each do |configuration|
-        search_paths = configuration.build_settings['FRAMEWORK_SEARCH_PATHS'] ||= '$(inherited)'
-        search_paths << ' "$(PLATFORM_DIR)/Developer/Library/Frameworks"'
-      end
-    end
-
-    def write_app_import_source_file(pod_target)
-      language = pod_target.uses_swift? ? :swift : :objc
-
-      if language == :swift
-        source_file = validation_dir.+('App/main.swift')
-        source_file.parent.mkpath
-        import_statement = use_frameworks && pod_target.should_build? ? "import #{pod_target.product_module_name}\n" : ''
-        source_file.open('w') { |f| f << import_statement }
-      else
-        source_file = validation_dir.+('App/main.m')
-        source_file.parent.mkpath
-        import_statement = if use_frameworks && pod_target.should_build?
-                             "@import #{pod_target.product_module_name};\n"
-                           else
-                             header_name = "#{pod_target.product_module_name}/#{pod_target.product_module_name}.h"
-                             if pod_target.sandbox.public_headers.root.+(header_name).file?
-                               "#import <#{header_name}>\n"
-                             else
-                               ''
-                             end
-        end
-        source_file.open('w') do |f|
-          f << "@import Foundation;\n"
-          f << "@import UIKit;\n" if consumer.platform_name == :ios || consumer.platform_name == :tvos
-          f << "@import Cocoa;\n" if consumer.platform_name == :osx
-          f << "#{import_statement}int main() {}\n"
-        end
-      end
-      source_file
+    # Returns the pod target for the pod being validated. Installation must have occurred before this can be invoked.
+    #
+    def validation_pod_target
+      @installer.pod_targets.find { |pt| pt.pod_name == spec.root.name }
     end
 
     # It creates a podfile in memory and builds a library containing the pod
@@ -494,21 +630,64 @@ module Pod
          perform_post_install_actions).each { |m| @installer.send(m) }
 
       deployment_target = spec.subspec_by_name(subspec_name).deployment_target(consumer.platform_name)
-      @installer.aggregate_targets.each do |target|
-        target.pod_targets.each do |pod_target|
-          next unless native_target = pod_target.native_target
-          native_target.build_configuration_list.build_configurations.each do |build_configuration|
-            (build_configuration.build_settings['OTHER_CFLAGS'] ||= '$(inherited)') << ' -Wincomplete-umbrella'
-            build_configuration.build_settings['SWIFT_VERSION'] = swift_version if pod_target.uses_swift?
+      configure_pod_targets(@installer.target_installation_results)
+      validate_dynamic_framework_support(@installer.aggregate_targets, deployment_target)
+      @installer.pods_project.save
+    end
+
+    # @param [Array<Hash{String, TargetInstallationResult}>] target_installation_results
+    #        The installation results to configure
+    #
+    def configure_pod_targets(target_installation_results)
+      target_installation_results.first.values.each do |pod_target_installation_result|
+        pod_target = pod_target_installation_result.target
+        native_target = pod_target_installation_result.native_target
+        native_target.build_configuration_list.build_configurations.each do |build_configuration|
+          (build_configuration.build_settings['OTHER_CFLAGS'] ||= '$(inherited)') << ' -Wincomplete-umbrella'
+          if pod_target.uses_swift?
+            # The Swift version for the target being validated can be overridden by `--swift-version` or the
+            # `.swift-version` file so we always use the derived Swift version.
+            #
+            # For dependencies, if the derived Swift version is supported then it is the one used. Otherwise, the Swift
+            # version for dependencies is inferred by the target that is integrating them.
+            swift_version = if pod_target == validation_pod_target
+                              derived_swift_version
+                            else
+                              pod_target.spec_swift_versions.map(&:to_s).find do |v|
+                                v == derived_swift_version
+                              end || pod_target.swift_version
+                            end
+            build_configuration.build_settings['SWIFT_VERSION'] = swift_version
           end
         end
-        if target.pod_targets.any?(&:uses_swift?) && consumer.platform_name == :ios &&
-            (deployment_target.nil? || Version.new(deployment_target).major < 8)
+        pod_target_installation_result.test_specs_by_native_target.each do |test_native_target, test_spec|
+          if pod_target.uses_swift_for_spec?(test_spec)
+            test_native_target.build_configuration_list.build_configurations.each do |build_configuration|
+              swift_version = pod_target == validation_pod_target ? derived_swift_version : pod_target.swift_version
+              build_configuration.build_settings['SWIFT_VERSION'] = swift_version
+            end
+          end
+        end
+      end
+    end
+
+    # Produces an error of dynamic frameworks were requested but are not supported by the deployment target
+    #
+    # @param [Array<AggregateTarget>] aggregate_targets
+    #        The aggregate targets installed by the installer
+    #
+    # @param [String,Version] deployment_target
+    #        The deployment target of the installation
+    #
+    def validate_dynamic_framework_support(aggregate_targets, deployment_target)
+      return unless consumer.platform_name == :ios
+      return unless deployment_target.nil? || Version.new(deployment_target).major < 8
+      aggregate_targets.each do |target|
+        if target.pod_targets.any?(&:uses_swift?)
           uses_xctest = target.spec_consumers.any? { |c| (c.frameworks + c.weak_frameworks).include? 'XCTest' }
           error('swift', 'Swift support uses dynamic frameworks and is therefore only supported on iOS > 8.') unless uses_xctest
         end
       end
-      @installer.pods_project.save
     end
 
     def validate_vendored_dynamic_frameworks
@@ -527,37 +706,75 @@ module Pod
     # Performs platform specific analysis. It requires to download the source
     # at each iteration
     #
-    # @note   Xcode warnings are treaded as notes because the spec maintainer
+    # @note   Xcode warnings are treated as notes because the spec maintainer
     #         might not be the author of the library
     #
     # @return [void]
     #
     def build_pod
       if !xcodebuild_available?
-        UI.warn "Skipping compilation with `xcodebuild' because it can't be found.\n".yellow
+        UI.warn "Skipping compilation with `xcodebuild` because it can't be found.\n".yellow
       else
-        UI.message "\nBuilding with xcodebuild.\n".yellow do
-          output = xcodebuild
-          UI.puts output
-          parsed_output = parse_xcodebuild_output(output)
-          parsed_output.each do |message|
-            # Checking the error for `InputFile` is to work around an Xcode
-            # issue where linting would fail even though `xcodebuild` actually
-            # succeeds. Xcode.app also doesn't fail when this issue occurs, so
-            # it's safe for us to do the same.
-            #
-            # For more details see https://github.com/CocoaPods/CocoaPods/issues/2394#issuecomment-56658587
-            #
-            if message.include?("'InputFile' should have")
-              next
-            end
-
-            if message =~ /\S+:\d+:\d+: error:/
-              error('xcodebuild', message)
-            elsif message =~ /\S+:\d+:\d+: warning:/
-              warning('xcodebuild', message)
+        UI.message "\nBuilding with `xcodebuild`.\n".yellow do
+          scheme = if skip_import_validation?
+                     validation_pod_target.label if validation_pod_target.should_build?
+                   else
+                     'App'
+                   end
+          if scheme.nil?
+            UI.warn "Skipping compilation with `xcodebuild` because target contains no sources.\n".yellow
+          else
+            requested_configuration = configuration ? configuration : 'Release'
+            if analyze
+              output = xcodebuild('analyze', scheme, requested_configuration, :deployment_target => deployment_target)
+              find_output = Executable.execute_command('find', [validation_dir, '-name', '*.html'], false)
+              if find_output != ''
+                message = 'Static Analysis failed.'
+                message += ' You can use `--verbose` for more information.' unless config.verbose?
+                message += ' You can use `--no-clean` to save a reproducible buid environment.' unless no_clean
+                error('build_pod', message)
+              end
             else
-              note('xcodebuild', message)
+              output = xcodebuild('build', scheme, requested_configuration, :deployment_target => deployment_target)
+            end
+            parsed_output = parse_xcodebuild_output(output)
+            translate_output_to_linter_messages(parsed_output)
+          end
+        end
+      end
+    end
+
+    # Builds and runs all test sources associated with the current specification being validated.
+    #
+    # @note   Xcode warnings are treated as notes because the spec maintainer
+    #         might not be the author of the library
+    #
+    # @return [void]
+    #
+    def test_pod
+      if !xcodebuild_available?
+        UI.warn "Skipping test validation with `xcodebuild` because it can't be found.\n".yellow
+      else
+        UI.message "\nTesting with `xcodebuild`.\n".yellow do
+          pod_target = validation_pod_target
+          all_test_specs = consumer.spec.test_specs
+          unless test_specs.nil?
+            test_spec_names = all_test_specs.map(&:base_name)
+            all_test_specs.select! { |test_spec| test_specs.include? test_spec.base_name }
+            test_specs.each do |test_spec|
+              unless test_spec_names.include? test_spec
+                UI.warn "Requested test spec `#{test_spec}` does not exist in the podspec. Existing test specs are `#{test_spec_names}`"
+              end
+            end
+          end
+          all_test_specs.each do |test_spec|
+            if !test_spec.supported_on_platform?(consumer.platform_name)
+              UI.warn "Skipping test spec `#{test_spec.name}` on platform `#{consumer.platform_name}` since it is not supported.\n".yellow
+            else
+              scheme = @installer.target_installation_results.first[pod_target.name].native_target_for_spec(test_spec)
+              output = xcodebuild('test', scheme, 'Debug', :deployment_target => test_spec.deployment_target(consumer.platform_name))
+              parsed_output = parse_xcodebuild_output(output)
+              translate_output_to_linter_messages(parsed_output)
             end
           end
         end
@@ -570,7 +787,7 @@ module Pod
 
     FILE_PATTERNS = %i(source_files resources preserve_paths vendored_libraries
                        vendored_frameworks public_header_files preserve_paths
-                       private_header_files resource_bundles).freeze
+                       project_header_files private_header_files resource_bundles).freeze
 
     # It checks that every file pattern specified in a spec yields
     # at least one file. It requires the pods to be already present
@@ -582,10 +799,8 @@ module Pod
       FILE_PATTERNS.each do |attr_name|
         if respond_to?("_validate_#{attr_name}", true)
           send("_validate_#{attr_name}")
-        end
-
-        if !file_accessor.spec_consumer.send(attr_name).empty? && file_accessor.send(attr_name).empty?
-          error('file patterns', "The `#{attr_name}` pattern did not match any file.")
+        else
+          validate_nonempty_patterns(attr_name, :error)
         end
       end
 
@@ -596,12 +811,42 @@ module Pod
       end
     end
 
+    # Validates that the file patterns in `attr_name` match at least 1 file.
+    #
+    # @param [String,Symbol] attr_name the name of the attribute to check (ex. :public_header_files)
+    #
+    # @param [String,Symbol] message_type the type of message to send if the patterns are empty (ex. :error)
+    #
+    def validate_nonempty_patterns(attr_name, message_type)
+      return unless !file_accessor.spec_consumer.send(attr_name).empty? && file_accessor.send(attr_name).empty?
+
+      add_result(message_type, 'file patterns', "The `#{attr_name}` pattern did not match any file.")
+    end
+
+    def _validate_vendored_libraries
+      file_accessor.vendored_libraries.each do |lib|
+        basename = File.basename(lib)
+        lib_name = basename.downcase
+        unless lib_name.end_with?('.a') && lib_name.start_with?('lib')
+          warning('vendored_libraries', "`#{basename}` does not match the expected static library name format `lib[name].a`")
+        end
+      end
+      validate_nonempty_patterns(:vendored_libraries, :warning)
+    end
+
+    def _validate_project_header_files
+      _validate_header_files(:project_header_files)
+      validate_nonempty_patterns(:project_header_files, :warning)
+    end
+
     def _validate_private_header_files
       _validate_header_files(:private_header_files)
+      validate_nonempty_patterns(:private_header_files, :warning)
     end
 
     def _validate_public_header_files
       _validate_header_files(:public_header_files)
+      validate_nonempty_patterns(:public_header_files, :warning)
     end
 
     def _validate_license
@@ -678,6 +923,29 @@ module Pod
       add_result(:note, *args)
     end
 
+    def translate_output_to_linter_messages(parsed_output)
+      parsed_output.each do |message|
+        # Checking the error for `InputFile` is to work around an Xcode
+        # issue where linting would fail even though `xcodebuild` actually
+        # succeeds. Xcode.app also doesn't fail when this issue occurs, so
+        # it's safe for us to do the same.
+        #
+        # For more details see https://github.com/CocoaPods/CocoaPods/issues/2394#issuecomment-56658587
+        #
+        if message.include?("'InputFile' should have")
+          next
+        end
+
+        if message =~ /\S+:\d+:\d+: error:/
+          error('xcodebuild', message)
+        elsif message =~ /\S+:\d+:\d+: warning:/
+          warning('xcodebuild', message)
+        else
+          note('xcodebuild', message)
+        end
+      end
+    end
+
     def shares_pod_target_xcscheme?(pod_target)
       Pathname.new(@installer.pods_project.path + pod_target.label).exist?
     end
@@ -724,8 +992,11 @@ module Pod
     #         the deployment target, which should be declared in
     #         the Podfile.
     #
-    # @param  [Bool] use_frameworks
+    # @param  [Boolean] use_frameworks
     #         whether frameworks should be used for the installation
+    #
+    # @param [Array<String>] test_spec_names
+    #         the test spec names to include in the podfile.
     #
     # @return [Podfile] a podfile that requires the specification on the
     #         current platform.
@@ -733,21 +1004,50 @@ module Pod
     # @note   The generated podfile takes into account whether the linter is
     #         in local mode.
     #
-    def podfile_from_spec(platform_name, deployment_target, use_frameworks = true)
+    def podfile_from_spec(platform_name, deployment_target, use_frameworks = true, test_spec_names = [], use_modular_headers = false, use_static_frameworks = false)
       name     = subspec_name || spec.name
       podspec  = file.realpath
       local    = local?
       urls     = source_urls
+
+      additional_podspec_pods = external_podspecs ? Dir.glob(external_podspecs) : []
+      additional_path_pods = (include_podspecs ? Dir.glob(include_podspecs) : []) .select { |path| spec.name != Specification.from_file(path).name } - additional_podspec_pods
+
       Pod::Podfile.new do
-        install! 'cocoapods', :deterministic_uuids => false
+        install! 'cocoapods', :deterministic_uuids => false, :warn_for_unused_master_specs_repo => false
+        # By default inhibit warnings for all pods, except the one being validated.
+        inhibit_all_warnings!
         urls.each { |u| source(u) }
         target 'App' do
-          use_frameworks!(use_frameworks)
+          if use_static_frameworks
+            use_frameworks!(:linkage => :static)
+          else
+            use_frameworks!(use_frameworks)
+          end
+          use_modular_headers! if use_modular_headers
           platform(platform_name, deployment_target)
           if local
-            pod name, :path => podspec.dirname.to_s
+            pod name, :path => podspec.dirname.to_s, :inhibit_warnings => false
           else
-            pod name, :podspec => podspec.to_s
+            pod name, :podspec => podspec.to_s, :inhibit_warnings => false
+          end
+
+          additional_path_pods.each do |podspec_path|
+            podspec_name = File.basename(podspec_path, '.*')
+            pod podspec_name, :path => File.dirname(podspec_path)
+          end
+
+          additional_podspec_pods.each do |podspec_path|
+            podspec_name = File.basename(podspec_path, '.*')
+            pod podspec_name, :podspec => podspec_path
+          end
+
+          test_spec_names.each do |test_spec_name|
+            if local
+              pod test_spec_name, :path => podspec.dirname.to_s, :inhibit_warnings => false
+            else
+              pod test_spec_name, :podspec => podspec.to_s, :inhibit_warnings => false
+            end
           end
         end
       end
@@ -771,7 +1071,7 @@ module Pod
           l.include?('note: ') && (l !~ /expanded from macro/)
       end
       selected_lines.map do |l|
-        new = l.gsub(%r{#{validation_dir}/Pods/}, '')
+        new = l.force_encoding('UTF-8').gsub(%r{#{validation_dir}/Pods/}, '')
         new.gsub!(/^ */, ' ')
       end
     end
@@ -779,20 +1079,23 @@ module Pod
     # @return [String] Executes xcodebuild in the current working directory and
     #         returns its output (both STDOUT and STDERR).
     #
-    def xcodebuild
+    def xcodebuild(action, scheme, configuration, deployment_target:)
       require 'fourflusher'
-      scheme = if skip_import_validation?
-                 @installer.pod_targets.find { |pt| pt.pod_name == spec.root.name }.label
-               else
-                 'App'
-      end
-      command = %W(clean build -workspace #{File.join(validation_dir, 'App.xcworkspace')} -scheme #{scheme} -configuration Release)
+      command = %W(clean #{action} -workspace #{File.join(validation_dir, 'App.xcworkspace')} -scheme #{scheme} -configuration #{configuration})
       case consumer.platform_name
       when :osx, :macos
         command += %w(CODE_SIGN_IDENTITY=)
       when :ios
         command += %w(CODE_SIGN_IDENTITY=- -sdk iphonesimulator)
         command += Fourflusher::SimControl.new.destination(:oldest, 'iOS', deployment_target)
+        xcconfig = consumer.pod_target_xcconfig
+        if xcconfig
+          archs = xcconfig['VALID_ARCHS']
+          if archs && (archs.include? 'armv7') && !(archs.include? 'i386') && (archs.include? 'x86_64')
+            # Prevent Xcodebuild from testing the non-existent i386 simulator if armv7 is specified without i386
+            command += %w(ARCHS=x86_64)
+          end
+        end
       when :watchos
         command += %w(CODE_SIGN_IDENTITY=- -sdk watchsimulator)
         command += Fourflusher::SimControl.new.destination(:oldest, 'watchOS', deployment_target)
@@ -801,25 +1104,65 @@ module Pod
         command += Fourflusher::SimControl.new.destination(:oldest, 'tvOS', deployment_target)
       end
 
-      output, status = _xcodebuild(command)
+      if analyze
+        command += %w(CLANG_ANALYZER_OUTPUT=html CLANG_ANALYZER_OUTPUT_DIR=analyzer)
+      end
 
-      unless status.success?
+      begin
+        _xcodebuild(command, true)
+      rescue => e
         message = 'Returned an unsuccessful exit code.'
         message += ' You can use `--verbose` for more information.' unless config.verbose?
         error('xcodebuild', message)
+        e.message
       end
-
-      output
     end
 
     # Executes the given command in the current working directory.
     #
-    # @return [(String, Status)] The output of the given command and its
-    #         resulting status.
+    # @return [String] The output of the given command
     #
-    def _xcodebuild(command)
-      UI.puts 'xcodebuild ' << command.join(' ') if config.verbose
-      Executable.capture_command('xcodebuild', command, :capture => :merge)
+    def _xcodebuild(command, raise_on_failure = false)
+      Executable.execute_command('xcodebuild', command, raise_on_failure)
+    end
+
+    # Whether the platform with the specified name is valid
+    #
+    # @param  [Platform] platform
+    #         The platform to check
+    #
+    # @return [Boolean] True if the platform is valid
+    #
+    def valid_platform?(platform)
+      VALID_PLATFORMS.any? { |p| p.name == platform.name }
+    end
+
+    # Whether the platform is supported by the specification
+    #
+    # @param  [Platform] platform
+    #         The platform to check
+    #
+    # @param  [Specification] spec
+    #         The specification which must support the provided platform
+    #
+    # @return [Boolean] Whether the platform is supported by the specification
+    #
+    def supported_platform?(platform, spec)
+      available_platforms = spec.available_platforms
+
+      available_platforms.any? { |p| p.name == platform.name }
+    end
+
+    # Whether the provided name matches the platform
+    #
+    # @param  [Platform] platform
+    #         The platform
+    #
+    # @param  [String] name
+    #         The name to check against the provided platform
+    #
+    def platform_name_match?(platform, name)
+      [platform.name, platform.string_name].any? { |n| n.casecmp(name) == 0 }
     end
 
     #-------------------------------------------------------------------------#

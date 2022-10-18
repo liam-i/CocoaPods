@@ -1,4 +1,4 @@
-# rubocop:disable Style/FileName
+# rubocop:disable Naming/FileName
 
 require 'open-uri'
 
@@ -8,7 +8,7 @@ module OpenURI
   # Whether {#open} should follow a redirect.
   #
   # Inspiration from: https://gist.github.com/1271420
-  # Relevant issue:   http://redmine.ruby-lang.org/issues/3719
+  # Relevant issue:   https://bugs.ruby-lang.org/issues/3719
   # Source here:      https://github.com/ruby/ruby/blob/trunk/lib/open-uri.rb
   #
   # This test is intended to forbid a redirection from http://... to
@@ -24,7 +24,7 @@ module OpenURI
   # @param [URI::Generic] uri2
   #        the target uri where to where the redirect points to
   #
-  # @return [Bool]
+  # @return [Boolean]
   #
   def self.redirectable?(uri1, uri2)
     uri1.scheme.downcase == uri2.scheme.downcase ||

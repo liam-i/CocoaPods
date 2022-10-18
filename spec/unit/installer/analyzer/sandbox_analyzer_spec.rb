@@ -7,10 +7,11 @@ module Pod
     before do
       @spec = fixture_spec('banana-lib/BananaLib.podspec')
       @sandbox = config.sandbox
+      @podfile = Pod::Podfile.new
       lockfile_hash = { 'PODS' => ['BananaLib (1.0)'] }
       @manifest = Pod::Lockfile.new(lockfile_hash)
       @sandbox.stubs(:manifest).returns(@manifest)
-      @analyzer = Installer::Analyzer::SandboxAnalyzer.new(@sandbox, [@spec], false)
+      @analyzer = Installer::Analyzer::SandboxAnalyzer.new(@sandbox, @podfile, [@spec], false)
     end
 
     #-------------------------------------------------------------------------#
@@ -83,6 +84,23 @@ module Pod
         @sandbox.stubs(:predownloaded?).returns(true)
         @analyzer.send(:pod_changed?, 'BananaLib').should == true
       end
+
+      it 'considers a changed Pod whose dependency is changed' do
+        dep1 = Dependency.new('BananaLib', :git => 'https://github.com/grafiszti/bananalib.git')
+        dep2 = Dependency.new('BananaLib')
+        @analyzer.stubs(:sandbox_dependency).returns(dep1)
+        @analyzer.stubs(:podfile_dependency).returns(dep2)
+        @analyzer.send(:pod_changed?, 'BananaLib').should == true
+      end
+
+      it 'does not consider the podspec repo on whether a dependency has changed' do
+        dep1 = Dependency.new('BananaLib')
+        dep2 = Dependency.new('BananaLib')
+        dep2.podspec_repo = 'https://some/repo/my_repo.git'
+        @analyzer.stubs(:sandbox_dependency).returns(dep1)
+        @analyzer.stubs(:podfile_dependency).returns(dep2)
+        @analyzer.send(:pod_changed?, 'BananaLib').should == false
+      end
     end
 
     #-------------------------------------------------------------------------#
@@ -90,13 +108,6 @@ module Pod
     describe 'Private helpers' do
       it 'returns the sandbox manifest' do
         @analyzer.send(:sandbox_manifest).should == @manifest
-      end
-
-      it 'returns the lockfile as the sandbox if one is not available' do
-        lockfile = Lockfile.new({})
-        @sandbox.stubs(:manifest)
-        @analyzer.stubs(:lockfile).returns(lockfile)
-        @analyzer.send(:sandbox_manifest).should == lockfile
       end
 
       #--------------------------------------#

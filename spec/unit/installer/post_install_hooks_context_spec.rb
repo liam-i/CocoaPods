@@ -10,19 +10,19 @@ module Pod
       user_project = Xcodeproj::Project.open(SpecHelper.create_sample_app_copy_from_fixture('SampleProject'))
       user_target = user_project.native_targets.find { |np| np.name == 'SampleProject' }
       target_definition = fixture_target_definition
-      pod_target = PodTarget.new([spec], [target_definition], config.sandbox)
-      umbrella = AggregateTarget.new(target_definition, config.sandbox)
-      umbrella.user_project = user_project
-      umbrella.user_target_uuids = [user_target.uuid]
+      pod_target = PodTarget.new(sandbox, BuildType.static_library, {}, [], Platform.ios, [spec], [target_definition], nil)
+      umbrella = AggregateTarget.new(sandbox, BuildType.static_library, {}, [], Platform.ios, target_definition,
+                                     config.sandbox.root.dirname, user_project, [user_target.uuid],
+                                     'Release' => [pod_target])
       umbrella.stubs(:platform).returns(Platform.new(:ios, '8.0'))
-      umbrella.pod_targets = [pod_target]
 
-      result = Installer::PostInstallHooksContext.generate(sandbox, [umbrella])
+      result = Installer::PostInstallHooksContext.generate(sandbox, pods_project, [], [umbrella])
       result.class.should == Installer::PostInstallHooksContext
       result.sandbox_root.should == '/path'
       result.pods_project.should == pods_project
       result.sandbox.should == sandbox
       result.umbrella_targets.count.should == 1
+      result.generated_projects.should == [pods_project]
       umbrella_target = result.umbrella_targets.first
       umbrella_target.user_targets.should == [user_target]
       umbrella_target.user_target_uuids.should == [user_target.uuid]

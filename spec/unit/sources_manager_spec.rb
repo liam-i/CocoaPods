@@ -1,5 +1,4 @@
 require File.expand_path('../../spec_helper', __FILE__)
-require 'webmock'
 
 def set_up_test_repo_for_update
   set_up_test_repo
@@ -15,11 +14,37 @@ def set_up_test_repo_for_update
   @sources_manager.stubs(:repos_dir).returns(SpecHelper.tmp_repos_path)
 end
 
+CDN_REPO_RESPONSE = '---
+            min: 1.0.0
+            last: 1.8.1
+            prefix_lengths:
+            - 1
+            - 1
+            - 1'.freeze
+
+def stub_url_as_cdn(url)
+  WebMock.stub_request(:get, url.chomp('/') + '/CocoaPods-version.yml').
+    to_return(:status => 200, :headers => {}, :body => CDN_REPO_RESPONSE)
+end
+
+def stub_as_404(url)
+  WebMock.stub_request(:get, url.chomp('/') + '/CocoaPods-version.yml').
+    to_return(:status => 404, :headers => {}, :body => '')
+end
+
 module Pod
   describe Source::Manager do
+    extend SpecHelper::TemporaryRepos
     before do
+      WebMock.reset!
       @test_source = Source.new(fixture('spec-repos/test_repo'))
       @sources_manager = Source::Manager.new(config.repos_dir)
+      stub_url_as_cdn('https://cdn.cocoapods.org')
+      stub_url_as_cdn('http://cdn.cocoapods.org')
+    end
+
+    after do
+      WebMock.reset!
     end
 
     #-------------------------------------------------------------------------#
@@ -47,11 +72,45 @@ module Pod
               should == 'url'
           end
 
+          it 'runs `pod repo add-cdn` when there is no matching source for CocoaPods Trunk' do
+            Command::Repo::AddCDN.any_instance.stubs(:run).once
+            @sources_manager.stubs(:source_with_url).returns(nil).then.returns(TrunkSource.new('trunk'))
+            @sources_manager.find_or_create_source_with_url(Pod::TrunkSource::TRUNK_REPO_URL).name.
+              should == 'trunk'
+          end
+
           it 'runs `pod repo add` when there is no matching source' do
             Command::Repo::Add.any_instance.stubs(:run).once
+            stub_as_404('https://github.com/artsy/Specs.git')
             @sources_manager.stubs(:source_with_url).returns(nil).then.returns(Source.new('Source'))
             @sources_manager.find_or_create_source_with_url('https://github.com/artsy/Specs.git').name.
               should == 'Source'
+          end
+
+          it 'runs `pod repo add` when the url doesn\'t end in `.git`' do
+            Command::Repo::Add.any_instance.stubs(:run).once
+            stub_as_404('https://github.com/artsy/Specs')
+            @sources_manager.stubs(:source_with_url).returns(nil).then.returns(Source.new('Source'))
+            @sources_manager.find_or_create_source_with_url('https://github.com/artsy/Specs').name.
+              should == 'Source'
+          end
+
+          it 'runs `pod repo add-cdn` when there is no matching source and url is web' do
+            Command::Repo::AddCDN.any_instance.stubs(:run).once
+            stub_url_as_cdn('https://website.com/Specs')
+            @sources_manager.stubs(:source_with_url).returns(nil).then.returns(Source.new('Source'))
+            @sources_manager.find_or_create_source_with_url('https://website.com/Specs').name.
+              should == 'Source'
+          end
+
+          it 'raises informative exception on network error' do
+            OpenURI.stubs(:open_uri).with do
+              raise StandardError, 'some network error'
+            end
+            @sources_manager.stubs(:source_with_url).returns(nil)
+            should.raise(Informative) do
+              @sources_manager.cdn_url?('https://website.com/Specs')
+            end.message.should.include "Couldn't determine repo type for URL: `https://website.com/Specs`: some network error"
           end
 
           it 'handles repositories without a remote url' do # for #2965
@@ -70,10 +129,87 @@ module Pod
 
           it 'tries by url when there is no matching name' do
             Command::Repo::Add.any_instance.stubs(:run).once
+            stub_as_404('https://github.com/artsy/Specs.git')
             @sources_manager.stubs(:source_with_url).returns(nil).then.returns('Source')
             @sources_manager.source_with_name_or_url('https://github.com/artsy/Specs.git').
               should == 'Source'
           end
+        end
+      end
+
+      describe '#add_source' do
+        it 'adds the source to the list of sources' do
+          source = Source.new(fixture('spec-repos/test_repo1'))
+          @sources_manager.add_source(source)
+          @sources_manager.all.should == [@test_source, source]
+        end
+      end
+
+      describe 'detect cdn repo' do
+        it 'cdn master spec repo' do
+          @sources_manager.cdn_url?('https://cdn.cocoapods.org').should == true
+        end
+
+        it 'cdn master spec repo by http' do
+          @sources_manager.cdn_url?('http://cdn.cocoapods.org').should == true
+        end
+
+        it 'spec repo with userinfo' do
+          @sources_manager.cdn_url?('https://foo:bar@bitbucket.org/foobar/Specs.git').should == false
+        end
+
+        it 'git master spec repo' do
+          stub_as_404('https://github.com/cocoapods/specs.git')
+          stub_as_404('https://github.com/cocoapods/specs')
+          @sources_manager.cdn_url?('https://github.com/cocoapods/specs.git').should == false
+          @sources_manager.cdn_url?('https://github.com/cocoapods/specs').should == false
+        end
+
+        it 'netrc' do
+          WebMock.stub_request(:get, 'https://some_host.com/something/CocoaPods-version.yml').
+            with(:basic_auth => %w[user1 xxx]).
+            to_return(:status => 200, :body => CDN_REPO_RESPONSE)
+
+          netrc_file = temporary_directory + '.netrc'
+          File.open(netrc_file, 'w', 0o600) { |f| f.write("machine some_host.com\nlogin user1\npassword xxx\n") }
+
+          ENV['NETRC'] = temporary_directory.to_s
+          @sources_manager.cdn_url?('https://some_host.com/something').should == true
+          ENV.delete('NETRC')
+        end
+
+        it 'fake 200 response' do
+          # really broken (not compatible with YAML) html that may return any endpoint
+          # i.e. login page after request redirect
+          HTML_RESPONSE = '<!DOCTYPE html>
+            <html class="devise-layout-html">
+            <head prefix="og: http://ogp.me/ns#">
+            <meta charset="utf-8">'.freeze
+          WebMock.stub_request(:get, 'https://some_host.com/something/CocoaPods-version.yml').
+            to_return(:status => 200, :body => HTML_RESPONSE)
+          @sources_manager.cdn_url?('https://some_host.com/something').should == false
+        end
+
+        it 'handles trailing slash' do
+          stub_url_as_cdn('http://some_host.com/something')
+          @sources_manager.cdn_url?('http://some_host.com/something').should == true
+          @sources_manager.cdn_url?('http://some_host.com/something/').should == true
+        end
+
+        it 'handles redirects' do
+          WebMock.stub_request(:get, 'http://some_host.com/something/CocoaPods-version.yml').
+            to_return(:status => 301, :body => '', :headers => { 'Location' => ['http://some_host.com'] })
+          WebMock.stub_request(:get, 'http://some_host.com').
+            to_return(:status => 200, :body => '', :headers => {})
+
+          @sources_manager.cdn_url?('http://some_host.com/something').should == false
+
+          WebMock.stub_request(:get, 'http://some_another_host.com/something/CocoaPods-version.yml').
+            to_return(:status => 301, :body => '', :headers => { 'Location' => ['http://some_another_host.com'] })
+          WebMock.stub_request(:get, 'http://some_another_host.com').
+            to_return(:status => 200, :body => CDN_REPO_RESPONSE)
+
+          @sources_manager.cdn_url?('http://some_another_host.com/something').should == true
         end
       end
     end
@@ -84,7 +220,7 @@ module Pod
       extend SpecHelper::TemporaryRepos
 
       before do
-        MasterSource.any_instance.stubs(:requires_update?).returns(true)
+        Source.any_instance.stubs(:unchanged_github_repo?).returns(false)
       end
 
       it 'updates source backed by a git repository' do
@@ -92,18 +228,18 @@ module Pod
         @sources_manager.expects(:update_search_index_if_needed_in_background).with({}).returns(nil)
 
         repo_update = sequence('repo update')
-        MasterSource.any_instance.
+        Source.any_instance.
           expects(:git!).
           with(%W(-C #{test_repo_path} fetch origin --progress)).
           in_sequence(repo_update)
 
-        MasterSource.any_instance.
+        Source.any_instance.
           expects(:git!).
           with(%W(-C #{test_repo_path} rev-parse --abbrev-ref HEAD)).
           returns("my-special-branch\n").
           in_sequence(repo_update)
 
-        MasterSource.any_instance.
+        Source.any_instance.
           expects(:git!).
           with(%W(-C #{test_repo_path} reset --hard origin/my-special-branch)).
           in_sequence(repo_update)
@@ -111,36 +247,28 @@ module Pod
         @sources_manager.update(test_repo_path.basename.to_s, true)
       end
 
-      it 'unshallows if the git repo is shallow' do
+      it 'updates source with --silent flag' do
         set_up_test_repo_for_update
-        test_repo_path.join('.git', 'shallow').open('w') { |f| f << 'a' * 40 }
         @sources_manager.expects(:update_search_index_if_needed_in_background).with({}).returns(nil)
 
-        repo_update = sequence('repo update')
-        MasterSource.any_instance.
+        repo_update = sequence('repo update --silent')
+        Source.any_instance.
           expects(:git!).
-          with(%W(-C #{test_repo_path} fetch --unshallow)).
+          with(%W(-C #{test_repo_path} fetch origin)).
           in_sequence(repo_update)
 
-        MasterSource.any_instance.
-          expects(:git!).
-          with(%W(-C #{test_repo_path} fetch origin --progress)).
-          in_sequence(repo_update)
-
-        MasterSource.any_instance.
+        Source.any_instance.
           expects(:git!).
           with(%W(-C #{test_repo_path} rev-parse --abbrev-ref HEAD)).
-          returns("master\n").
+          returns("my-special-branch\n").
           in_sequence(repo_update)
 
-        MasterSource.any_instance.
+        Source.any_instance.
           expects(:git!).
-          with(%W(-C #{test_repo_path} reset --hard origin/master)).
+          with(%W(-C #{test_repo_path} reset --hard origin/my-special-branch)).
           in_sequence(repo_update)
 
-        @sources_manager.update(test_repo_path.basename.to_s, true)
-
-        UI.output.should.match /deep fetch.+`master`.+improve future performance/
+        @sources_manager.update(test_repo_path.basename.to_s, false)
       end
 
       it 'prints a warning if the update failed' do
@@ -151,7 +279,7 @@ module Pod
         Source.any_instance.stubs(:git).with do |options|
           options.join(' ') == %W(-C #{test_repo_path} diff --name-only aabbccd..HEAD).join(' ')
         end.returns('')
-        MasterSource.any_instance.expects(:git!).with(%W(-C #{test_repo_path} fetch origin --progress)).raises(<<-EOS)
+        Source.any_instance.expects(:git!).with(%W(-C #{test_repo_path} fetch origin --progress)).raises(<<-EOS)
 fatal: '/dev/null' does not appear to be a git repository
 fatal: Could not read from remote repository.
 
@@ -163,7 +291,7 @@ and the repository exists.
       end
 
       it 'informs the user if there is an update for CocoaPods' do
-        master = @sources_manager.master.first
+        master = Pod::TrunkSource.new(repo_path('trunk'))
         master.stubs(:metadata).returns(Source::Metadata.new('last' => '999.0'))
         master.verify_compatibility!
         UI.output.should.match /CocoaPods 999.0 is available/
@@ -171,10 +299,15 @@ and the repository exists.
 
       it 'skips the update message if the user disabled the notification' do
         config.new_version_message = false
-        master = @sources_manager.master.first
+        master = Pod::TrunkSource.new(repo_path('trunk'))
         master.stubs(:metadata).returns(Source::Metadata.new('last' => '999.0'))
         master.verify_compatibility!
         UI.output.should.not.match /CocoaPods 999.0 is available/
+      end
+
+      it 'does not crash if the repos dir does not exist' do
+        sources_manager = Source::Manager.new(Pathname.new(Dir.tmpdir) + 'CocoaPods/RepoDir/DoesNotExist')
+        lambda { sources_manager.update }.should.not.raise
       end
     end
   end

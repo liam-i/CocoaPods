@@ -73,7 +73,7 @@ module Pod
         `git remote add origin #{@upstream}`
         `git remote -v`
         `git fetch -q`
-        `git branch --set-upstream-to=origin/master master`
+        `git branch --set-upstream-to=origin/main main`
       end
 
       # prepare the spec
@@ -97,6 +97,16 @@ module Pod
       e.message.should.match(/use the `pod trunk push` command/)
     end
 
+    it 'refuses to push if the repo is CDN' do
+      Dir.chdir(test_repo_path) do
+        `rm -rf .git`
+        File.open('.url', 'w') { |f| f.write(Pod::TrunkSource::TRUNK_REPO_URL) }
+      end
+      cmd = command('repo', 'push', 'master')
+      e = lambda { cmd.run }.should.raise Pod::Informative
+      e.message.should.match(/Cannot push to a CDN source/)
+    end
+
     it 'refuses to push if the repo is not clean' do
       Dir.chdir(test_repo_path) do
         `touch DIRTY_FILE`
@@ -106,6 +116,29 @@ module Pod
       e = lambda { cmd.run }.should.raise Pod::Informative
       e.message.should.match(/repo.*not clean/)
       (@upstream + 'PushTest/1.4/PushTest.podspec').should.not.exist?
+    end
+
+    it 'refuses to push if --no-overwrite is passed and the spec exists' do
+      cmd = command('repo', 'push', 'master', 'JSONKit.podspec', '--no-overwrite')
+      Dir.chdir(@upstream) { `git checkout -b tmp_for_push -q` }
+      cmd.expects(:validate_podspec_files).returns(true)
+
+      e = lambda { Dir.chdir(temporary_directory) { cmd.run } }.should.raise Pod::Informative
+      e.message.should == '[!] JSONKit (1.4) already exists and overwriting has been disabled.'
+
+      cmd = command('repo', 'push', 'master', 'PushTest.podspec', '--no-overwrite')
+      cmd.expects(:validate_podspec_files).returns(true)
+      Dir.chdir(temporary_directory) { cmd.run }
+      Pod::UI.output.should.include('[Add] PushTest (1.4)')
+    end
+
+    it 'refuses to push if --no-overwrite is passed, the spec exists and a commit message is present' do
+      cmd = command('repo', 'push', 'master', 'JSONKit.podspec', '--commit-message="foo"', '--no-overwrite')
+      Dir.chdir(@upstream) { `git checkout -b tmp_for_push -q` }
+      cmd.expects(:validate_podspec_files).returns(true)
+
+      e = lambda { Dir.chdir(temporary_directory) { cmd.run } }.should.raise Pod::Informative
+      e.message.should == '[!] JSONKit (1.4) already exists and overwriting has been disabled.'
     end
 
     it 'generate a message for commit' do
@@ -123,7 +156,7 @@ module Pod
       Dir.chdir(@upstream) { `git checkout -b tmp_for_push -q` }
       cmd.expects(:validate_podspec_files).returns(true)
       Dir.chdir(temporary_directory) { cmd.run }
-      Dir.chdir(@upstream) { `git checkout master -q` }
+      Dir.chdir(@upstream) { `git checkout main -q` }
       (@upstream + 'PushTest/1.4/PushTest.podspec').read.should.include('PushTest')
     end
 
@@ -132,7 +165,7 @@ module Pod
       Dir.chdir(@upstream) { `git checkout -b tmp_for_push -q` }
       cmd.expects(:validate_podspec_files).returns(true)
       Dir.chdir(temporary_directory) { cmd.run }
-      Dir.chdir(@upstream) { `git checkout master -q` }
+      Dir.chdir(@upstream) { `git checkout main -q` }
       (@upstream + 'PushTest/1.4/PushTest.podspec').read.should.include('PushTest')
     end
 
@@ -141,13 +174,23 @@ module Pod
       Dir.chdir(@upstream) { `git checkout -b tmp_for_push -q` }
       cmd.expects(:validate_podspec_files).returns(true)
       Dir.chdir(temporary_directory) { cmd.run }
-      Dir.chdir(@upstream) { `git checkout master -q` }
+      Dir.chdir(@upstream) { `git checkout main -q` }
       (@upstream + 'PushTest/1.4/PushTest.podspec.json').read.should.include('PushTest')
+    end
+
+    it 'successfully pushes a spec with flag update-sources' do
+      cmd = command('repo', 'push', 'master', '--update-sources')
+      Dir.chdir(@upstream) { `git checkout -b tmp_for_push -q` }
+      cmd.expects(:validate_podspec_files).returns(true)
+      cmd.expects(:update_sources)
+      Dir.chdir(temporary_directory) { cmd.run }
+      Dir.chdir(@upstream) { `git checkout main -q` }
+      cmd.instance_variable_get(:@update_sources).should.equal true
     end
 
     it 'initializes with default sources if no custom sources specified' do
       cmd = command('repo', 'push', 'master')
-      cmd.instance_variable_get(:@source_urls).should.equal [@upstream.to_s]
+      cmd.instance_variable_get(:@source_urls).should.equal [@upstream.to_s, Pod::TrunkSource::TRUNK_REPO_URL]
     end
 
     it 'initializes with custom sources if specified' do
@@ -156,7 +199,7 @@ module Pod
     end
 
     before do
-      %i(prepare resolve_dependencies download_dependencies).each do |m|
+      %i(prepare resolve_dependencies download_dependencies write_lockfiles).each do |m|
         Installer.any_instance.stubs(m)
       end
       Installer.any_instance.stubs(:aggregate_targets).returns([])
@@ -171,10 +214,10 @@ module Pod
     end
 
     it 'validates specs as frameworks by default' do
-      Validator.any_instance.expects(:podfile_from_spec).with(:ios, '8.0', true).times(3)
-      Validator.any_instance.expects(:podfile_from_spec).with(:osx, nil, true).twice
-      Validator.any_instance.expects(:podfile_from_spec).with(:watchos, nil, true).twice
-      Validator.any_instance.expects(:podfile_from_spec).with(:tvos, nil, true).twice
+      Validator.any_instance.expects(:podfile_from_spec).with(:ios, '8.0', true, [], false, nil).times(3).returns(stub('Podfile'))
+      Validator.any_instance.expects(:podfile_from_spec).with(:osx, nil, true, [], false, nil).twice.returns(stub('Podfile'))
+      Validator.any_instance.expects(:podfile_from_spec).with(:watchos, nil, true, [], false, nil).twice.returns(stub('Podfile'))
+      Validator.any_instance.expects(:podfile_from_spec).with(:tvos, nil, true, [], false, nil).twice.returns(stub('Podfile'))
 
       cmd = command('repo', 'push', 'master')
       # Git push will throw an exception here since this is a local custom git repo. All we care is the validator
@@ -185,10 +228,10 @@ module Pod
     end
 
     it 'validates specs as libraries if requested' do
-      Validator.any_instance.expects(:podfile_from_spec).with(:ios, nil, false).times(3)
-      Validator.any_instance.expects(:podfile_from_spec).with(:osx, nil, false).twice
-      Validator.any_instance.expects(:podfile_from_spec).with(:watchos, nil, false).twice
-      Validator.any_instance.expects(:podfile_from_spec).with(:tvos, nil, false).twice
+      Validator.any_instance.expects(:podfile_from_spec).with(:ios, nil, false, [], false, nil).times(3).returns(stub('Podfile'))
+      Validator.any_instance.expects(:podfile_from_spec).with(:osx, nil, false, [], false, nil).twice.returns(stub('Podfile'))
+      Validator.any_instance.expects(:podfile_from_spec).with(:watchos, nil, false, [], false, nil).twice.returns(stub('Podfile'))
+      Validator.any_instance.expects(:podfile_from_spec).with(:tvos, nil, false, [], false, nil).twice.returns(stub('Podfile'))
 
       cmd = command('repo', 'push', 'master', '--use-libraries')
       # Git push will throw an exception here since this is a local custom git repo. All we care is the validator
@@ -198,8 +241,24 @@ module Pod
       end.should.raise Informative
     end
 
+    it 'validates specs with modular headers if requested' do
+      Validator.any_instance.expects(:podfile_from_spec).with(:ios, nil, false, [], true, nil).times(3).returns(stub('Podfile'))
+      Validator.any_instance.expects(:podfile_from_spec).with(:osx, nil, false, [], true, nil).twice.returns(stub('Podfile'))
+      Validator.any_instance.expects(:podfile_from_spec).with(:watchos, nil, false, [], true, nil).twice.returns(stub('Podfile'))
+      Validator.any_instance.expects(:podfile_from_spec).with(:tvos, nil, false, [], true, nil).twice.returns(stub('Podfile'))
+
+      cmd = command('repo', 'push', 'master', '--use-libraries', '--use-modular-headers')
+      # Git push will throw an exception here since this is a local custom git repo. All we care is the validator
+      # tests so the exception is swallowed.
+      lambda do
+        Dir.chdir(temporary_directory) { cmd.run }
+      end.should.raise Informative
+    end
+
     it 'raises error and exit code when push fails' do
       cmd = command('repo', 'push', 'master')
+      Pod::TrunkSource.any_instance.stubs(:refresh_metadata)
+      cmd.instance_variable_set(:@source, Pod::TrunkSource.new(repo_path('trunk')))
       e = lambda do
         Dir.chdir(temporary_directory) { cmd.run }
       end.should.raise Informative

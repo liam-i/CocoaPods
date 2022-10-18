@@ -4,9 +4,10 @@ module Pod
   describe Installer::Analyzer do
     describe 'Analysis' do
       before do
-        repos = [Source.new(fixture('spec-repos/test_repo')), MasterSource.new(fixture('spec-repos/master'))]
+        repos = [Source.new(fixture('spec-repos/test_repo')), TrunkSource.new(fixture('spec-repos/trunk'))]
         aggregate = Pod::Source::Aggregate.new(repos)
-        config.sources_manager.stubs(:aggregate).returns(aggregate)
+        @sources_manager = Source::Manager.new(config.repos_dir)
+        @sources_manager.stubs(:aggregate).returns(aggregate)
         aggregate.sources.first.stubs(:url).returns(SpecHelper.test_repo_url)
 
         @podfile = Pod::Podfile.new do
@@ -36,21 +37,19 @@ module Pod
         @lockfile = Pod::Lockfile.new(hash)
 
         SpecHelper.create_sample_app_copy_from_fixture('SampleProject')
-        @analyzer = Pod::Installer::Analyzer.new(config.sandbox, @podfile, @lockfile)
+        @analyzer = Pod::Installer::Analyzer.new(config.sandbox, @podfile, @lockfile, [], true, false, @sources_manager)
       end
 
       it 'returns whether an installation should be performed' do
-        @analyzer.needs_install?.should.be.true
+        @analyzer.analyze.needs_install?.should.be.true
       end
 
       it 'returns whether the Podfile has changes' do
-        analysis_result = @analyzer.analyze(false)
-        @analyzer.podfile_needs_install?(analysis_result).should.be.true
+        @analyzer.analyze(false).podfile_needs_install?.should.be.true
       end
 
       it 'returns whether the sandbox is not in sync with the lockfile' do
-        analysis_result = @analyzer.analyze(false)
-        @analyzer.sandbox_needs_install?(analysis_result).should.be.true
+        @analyzer.analyze(false).sandbox_needs_install?.should.be.true
       end
 
       #--------------------------------------#
@@ -66,14 +65,14 @@ module Pod
       #--------------------------------------#
 
       it 'does not update unused sources' do
-        @analyzer.stubs(:sources).returns(config.sources_manager.master)
-        config.sources_manager.expects(:update).once.with('master', true)
+        @analyzer.stubs(:sources).returns(@sources_manager.master)
+        @sources_manager.expects(:update).once.with('trunk', true)
         @analyzer.update_repositories
       end
 
       it 'does not update sources if there are no dependencies' do
         podfile = Podfile.new do
-          source 'https://github.com/CocoaPods/Specs.git'
+          source Pod::TrunkSource::TRUNK_REPO_URL
           # No dependencies specified
         end
         config.verbose = true
@@ -83,7 +82,7 @@ module Pod
         analyzer.update_repositories
       end
 
-      it 'does not update non-git repositories' do
+      it 'does not update non-updateable repositories' do
         tmp_directory = Pathname(Dir.tmpdir) + 'CocoaPods'
         FileUtils.mkdir_p(tmp_directory)
         FileUtils.cp_r(ROOT + 'spec/fixtures/spec-repos/test_repo/', tmp_directory)
@@ -104,7 +103,7 @@ module Pod
         analyzer.stubs(:sources).returns([source])
         analyzer.update_repositories
 
-        UI.output.should.match /Skipping `#{source.name}` update because the repository is not a git source repository./
+        UI.output.should.match /Skipping `#{source.name}` update because the repository is not an updateable repository./
 
         FileUtils.rm_rf(non_git_repo)
       end
@@ -116,18 +115,72 @@ module Pod
           pod 'BananaLib', '1.0', :source => repo_url
           pod 'JSONKit', :source => repo_url
         end
-        config.verbose = true
 
         # Note that we are explicitly ignoring 'repo_1' since it isn't used.
-        source = mock
-        source.stubs(:name).returns('repo_2')
-        source.stubs(:repo).returns('/repo/cache/path')
-        config.sources_manager.expects(:find_or_create_source_with_url).with(repo_url).returns(source)
-        source.stubs(:git?).returns(true)
-        config.sources_manager.expects(:update).once.with(source.name, true)
+        source = mock('source', :name => 'repo_2', :updateable? => true)
+        sources_manager = Source::Manager.new(config.repos_dir)
+        sources_manager.expects(:find_or_create_source_with_url).with(repo_url).returns(source)
+        sources_manager.expects(:update).once.with('repo_2', true)
 
-        analyzer = Pod::Installer::Analyzer.new(config.sandbox, podfile, nil)
+        analyzer = Pod::Installer::Analyzer.new(config.sandbox, podfile, nil, [],
+                                                true, false, sources_manager)
         analyzer.update_repositories
+      end
+
+      it 'includes trunk if not all dependencies have a source' do
+        repo_url = 'https://url/to/specs.git'
+        podfile = Podfile.new do
+          pod 'BananaLib', '1.0'
+          pod 'JSONKit', :source => repo_url
+        end
+
+        source = mock('source')
+        mock_master = mock('source')
+        sources_manager = Source::Manager.new(config.repos_dir)
+        sources_manager.stubs(:master).returns([mock_master])
+        sources_manager.expects(:find_or_create_source_with_url).with(repo_url).returns(source)
+        sources_manager.expects(:find_or_create_source_with_url).with(Pod::TrunkSource::TRUNK_REPO_URL).returns(mock_master)
+
+        analyzer = Pod::Installer::Analyzer.new(config.sandbox, podfile, nil, [], true, false, sources_manager)
+        analyzer.sources.should == [mock_master, source]
+      end
+
+      it 'registers plugin sources with the sources manager' do
+        podfile = Podfile.new do
+          pod 'BananaLib', '1.0'
+          pod 'JSONKit'
+          pod 'PrivatePod'
+        end
+
+        spec = Pod::Specification.new do |s|
+          s.name = 'PrivatePod'
+          s.version = '1.0.0'
+          s.source_files = '**/*.swift'
+        end
+
+        repo_dir = SpecHelper.temporary_directory + 'repos'
+        repo_dir.mkpath
+
+        source_repo_dir = repo_dir + 'my-specs'
+        source_repo_dir.mkpath
+
+        plugin_source = Pod::Source.new(source_repo_dir)
+        plugin_source.stubs(:all_specs).returns([spec])
+        plugin_source.stubs(:url).returns('protocol://special-source.org/my-specs')
+        plugin_source.stubs(:updateable?).returns(false)
+
+        sources_manager = Source::Manager.new(repo_dir)
+        sources_manager.stubs(:cdn_url?).returns(false)
+
+        analyzer = Pod::Installer::Analyzer.new(config.sandbox, podfile, nil, [plugin_source], true, false, sources_manager)
+        analyzer.send(:sources)
+
+        dependency = Pod::Dependency.new('PrivatePod', '1.0.0', :source => 'protocol://special-source.org/my-specs')
+
+        result = sources_manager.aggregate_for_dependency(dependency)
+        result.sources.map(&:name).should == ['my-specs']
+
+        FileUtils.rm_rf(repo_dir.dirname)
       end
 
       #--------------------------------------#
@@ -164,6 +217,96 @@ module Pod
         target.platform.to_s.should == 'iOS 6.0'
       end
 
+      describe 'platform architectures' do
+        it 'correctly determines when a platform requires 64-bit architectures' do
+          Installer::Analyzer.send(:requires_64_bit_archs?, Platform.new(:ios, '11.0'), nil).should.be.true
+          Installer::Analyzer.send(:requires_64_bit_archs?, Platform.new(:ios, '12.0'), nil).should.be.true
+          Installer::Analyzer.send(:requires_64_bit_archs?, Platform.new(:ios, '10.0'), nil).should.be.false
+          Installer::Analyzer.send(:requires_64_bit_archs?, Platform.new(:osx), nil).should.be.true
+          Installer::Analyzer.send(:requires_64_bit_archs?, Platform.new(:tvos), nil).should.be.false
+          Installer::Analyzer.send(:requires_64_bit_archs?, Platform.new(:watchos), nil).should.be.false
+        end
+
+        it 'does not specify 64-bit architectures on Xcode 10+' do
+          Installer::Analyzer.send(:requires_64_bit_archs?, Platform.new(:ios, '11.0'), 49).should.be.true
+          Installer::Analyzer.send(:requires_64_bit_archs?, Platform.new(:ios, '11.0'), 50).should.be.false
+        end
+
+        it 'forces 64-bit architectures when required' do
+          @podfile = Pod::Podfile.new do
+            project 'SampleProject/SampleProject'
+            platform :ios, '11.0'
+            use_frameworks!
+            target 'TestRunner' do
+              pod 'AFNetworking'
+              pod 'JSONKit'
+            end
+          end
+          @analyzer = Pod::Installer::Analyzer.new(config.sandbox, @podfile, nil)
+          result = @analyzer.analyze
+
+          result.pod_targets.map(&:archs).uniq.should == [['$(ARCHS_STANDARD_64_BIT)']]
+        end
+
+        it 'forces 64-bit architectures only for the targets that require it' do
+          @podfile = Pod::Podfile.new do
+            project 'SampleProject/SampleProject'
+
+            use_frameworks!
+            target 'SampleProject' do
+              platform :ios, '10.0'
+              pod 'AFNetworking'
+              target 'TestRunner' do
+                platform :ios, '11.0'
+                pod 'JSONKit'
+                pod 'SOCKit'
+              end
+            end
+          end
+          Xcodeproj::Project.any_instance.stubs(:object_version).returns('49')
+          @analyzer = Pod::Installer::Analyzer.new(config.sandbox, @podfile, nil)
+          result = @analyzer.analyze
+
+          non_64_bit_target = result.pod_targets.shift
+
+          non_64_bit_target.send(:archs).should == []
+          result.pod_targets.map(&:archs).uniq.should == [['$(ARCHS_STANDARD_64_BIT)']]
+        end
+
+        it 'does not force 64-bit architectures on Xcode 10+' do
+          @podfile = Pod::Podfile.new do
+            project 'SampleProject/SampleProject'
+            platform :ios, '11.0'
+            use_frameworks!
+            target 'TestRunner' do
+              pod 'AFNetworking'
+              pod 'JSONKit'
+            end
+          end
+          Xcodeproj::Project.any_instance.stubs(:object_version).returns('50')
+          @analyzer = Pod::Installer::Analyzer.new(config.sandbox, @podfile, nil)
+          result = @analyzer.analyze
+
+          result.pod_targets.map(&:archs).uniq.should == [[]]
+        end
+
+        it 'does not specify archs value unless required' do
+          @podfile = Pod::Podfile.new do
+            project 'SampleProject/SampleProject'
+            platform :ios, '10.0'
+            use_frameworks!
+            target 'TestRunner' do
+              pod 'AFNetworking'
+              pod 'JSONKit'
+            end
+          end
+          @analyzer = Pod::Installer::Analyzer.new(config.sandbox, @podfile, nil)
+          result = @analyzer.analyze
+
+          result.pod_targets.map(&:archs).uniq.should == [[]]
+        end
+      end
+
       describe 'abstract targets' do
         it 'resolves' do
           @podfile = Pod::Podfile.new do
@@ -192,58 +335,867 @@ module Pod
       end
 
       describe 'dependent pod targets' do
-        it 'picks transitive dependencies up' do
+        it 'raises when a pod depends on a non-library spec' do
           @podfile = Pod::Podfile.new do
-            platform :ios, '8.0'
-            project 'SampleProject/SampleProject'
-            pod 'RestKit', '~> 0.23.0'
-            target 'TestRunner' do
-              pod 'RestKit/Testing', '~> 0.23.0'
-            end
-          end
-          @analyzer = Pod::Installer::Analyzer.new(config.sandbox, @podfile, nil)
-          result = @analyzer.analyze
-          result.targets.count.should == 1
-          target = result.targets.first
-          restkit_target = target.pod_targets.find { |pt| pt.pod_name == 'RestKit' }
-          restkit_target.dependent_targets.map(&:pod_name).sort.should == %w(
-            AFNetworking
-            ISO8601DateFormatterValueTransformer
-            RKValueTransformers
-            SOCKit
-            TransitionKit
-          )
-          restkit_target.dependent_targets.all?(&:scoped).should.be.true
-        end
-
-        it 'picks the right variants up when there are multiple' do
-          @podfile = Pod::Podfile.new do
-            source SpecHelper.test_repo_url
-            platform :ios, '8.0'
+            platform :ios, '10.0'
             project 'SampleProject/SampleProject'
 
             # The order of target definitions is important for this test.
-            target 'TestRunner' do
-              pod 'OrangeFramework'
-              pod 'matryoshka/Foo'
-            end
-
             target 'SampleProject' do
-              pod 'OrangeFramework'
+              pod 'a', :testspecs => %w(Tests), :appspecs => %w(App), :git => '.'
+              pod 'b', :testspecs => %w(Tests), :appspecs => %w(App), :git => '.'
             end
           end
-          @analyzer = Pod::Installer::Analyzer.new(config.sandbox, @podfile, nil)
-          result = @analyzer.analyze
 
-          result.targets.count.should == 2
+          pod_a = Pod::Spec.new do |s|
+            s.name = 'a'
+            s.version = '1.0'
+            s.test_spec 'Tests'
+            s.app_spec 'App'
+          end
+          pod_b = Pod::Spec.new do |s|
+            s.name = 'b'
+            s.version = '1.0'
+            s.dependency 'a/Tests'
+            s.test_spec 'Tests'
+            s.app_spec 'App'
+          end
 
-          pod_target = result.targets[0].pod_targets.find { |pt| pt.pod_name == 'OrangeFramework' }
-          pod_target.dependent_targets.count == 1
-          pod_target.dependent_targets.first.specs.map(&:name).should == %w(
-            matryoshka
-            matryoshka/Outer
-            matryoshka/Outer/Inner
-          )
+          analyze = -> do
+            sandbox = Pod::Sandbox.new(config.sandbox.root)
+            @analyzer = Pod::Installer::Analyzer.new(sandbox, @podfile, nil)
+            @analyzer.expects(:fetch_external_source).twice
+            @analyzer.sandbox.expects(:specification).with('a').returns(pod_a)
+            @analyzer.sandbox.expects(:specification).with('b').returns(pod_b)
+            @analyzer.analyze
+          end
+
+          analyze.should.raise(Informative).
+            message.should.include '`b (1.0)` depends upon `a/Tests (1.0)`, which is a `test` spec.'
+
+          pod_b = Pod::Spec.new do |s|
+            s.name = 'b'
+            s.version = '1.0'
+            s.test_spec 'Tests' do |ts|
+              ts.dependency 'b/App'
+            end
+            s.app_spec 'App'
+          end
+          analyze.should.raise(Informative).
+            message.should.include '`b/Tests (1.0)` depends upon `b/App (1.0)`, which is a `app` spec'
+        end
+
+        describe 'with deduplicate targets as true' do
+          before { Installer::InstallationOptions.any_instance.stubs(:deduplicate_targets? => true) }
+
+          it 'picks transitive dependencies up' do
+            @podfile = Pod::Podfile.new do
+              platform :ios, '8.0'
+              project 'SampleProject/SampleProject'
+              pod 'RestKit', '~> 0.23.0'
+              target 'TestRunner' do
+                pod 'RestKit/Testing', '~> 0.23.0'
+              end
+            end
+            @analyzer = Pod::Installer::Analyzer.new(config.sandbox, @podfile, nil)
+            result = @analyzer.analyze
+            result.targets.count.should == 1
+            target = result.targets.first
+            restkit_target = target.pod_targets.find { |pt| pt.pod_name == 'RestKit' }
+            restkit_target.dependent_targets.map(&:pod_name).sort.should == %w(
+              AFNetworking
+              ISO8601DateFormatterValueTransformer
+              RKValueTransformers
+              SOCKit
+              TransitionKit
+            )
+            restkit_target.recursive_dependent_targets.map(&:pod_name).sort.should == %w(
+              AFNetworking
+              ISO8601DateFormatterValueTransformer
+              RKValueTransformers
+              SOCKit
+              TransitionKit
+            )
+            restkit_target.dependent_targets.all?(&:scoped).should.be.true
+          end
+
+          it 'does not mark transitive dependencies as dependent targets' do
+            @podfile = Pod::Podfile.new do
+              platform :ios, '8.0'
+              project 'SampleProject/SampleProject'
+              target 'SampleProject'
+              pod 'Firebase', '3.9.0'
+              pod 'ARAnalytics', '4.0.0', :subspecs => %w(Firebase)
+            end
+            @analyzer = Pod::Installer::Analyzer.new(config.sandbox, @podfile, nil)
+            result = @analyzer.analyze
+            result.targets.count.should == 1
+            target = result.targets.first
+
+            firebase_target = target.pod_targets.find { |pt| pt.pod_name == 'Firebase' }
+            firebase_target.dependent_targets.map(&:pod_name).sort.should == %w(
+              FirebaseAnalytics FirebaseCore
+            )
+            firebase_target.recursive_dependent_targets.map(&:pod_name).sort.should == %w(
+              FirebaseAnalytics FirebaseCore FirebaseInstanceID GoogleInterchangeUtilities GoogleSymbolUtilities GoogleToolboxForMac
+            )
+            firebase_target.dependent_targets.all?(&:scoped).should.be.true
+
+            aranalytics_target = target.pod_targets.find { |pt| pt.pod_name == 'ARAnalytics' }
+            aranalytics_target.dependent_targets.map(&:pod_name).sort.should == %w(
+              Firebase
+            )
+            aranalytics_target.recursive_dependent_targets.map(&:pod_name).sort.should == %w(
+              Firebase FirebaseAnalytics FirebaseCore FirebaseInstanceID GoogleInterchangeUtilities GoogleSymbolUtilities GoogleToolboxForMac
+            )
+            aranalytics_target.dependent_targets.all?(&:scoped).should.be.true
+          end
+
+          it 'correctly computes recursive dependent targets' do
+            @podfile = Pod::Podfile.new do
+              platform :ios, '10.0'
+              project 'SampleProject/SampleProject'
+
+              # The order of target definitions is important for this test.
+              target 'SampleProject' do
+                pod 'a', :testspecs => %w(Tests)
+                pod 'b', :testspecs => %w(Tests)
+                pod 'c', :testspecs => %w(Tests)
+                pod 'd', :testspecs => %w(Tests)
+                pod 'app_host', :testspecs => %w(Tests)
+                pod 'base'
+              end
+            end
+
+            source = MockSource.new 'Source' do
+              pod 'base' do
+                test_spec do |ts|
+                  ts.dependency 'base_testing'
+                end
+              end
+
+              pod 'a' do |s|
+                s.dependency 'b'
+                s.dependency 'base'
+                test_spec do |ts|
+                  ts.dependency 'a_testing'
+                end
+              end
+
+              pod 'b' do |s|
+                s.dependency 'c'
+                test_spec do |ts|
+                end
+              end
+
+              pod 'c' do |s|
+                s.dependency 'e'
+                test_spec do |ts|
+                  ts.dependency 'a_testing'
+
+                  ts.requires_app_host = true
+                  ts.app_host_name = 'app_host/App'
+                  ts.dependency 'app_host/App'
+                end
+              end
+
+              pod 'd' do |s|
+                s.dependency 'a'
+                test_spec do |ts|
+                  ts.dependency 'b'
+                end
+              end
+
+              pod 'e' do |s|
+                s.dependency 'base'
+                test_spec do |ts|
+                end
+              end
+
+              pod 'a_testing' do |s|
+                s.dependency 'a'
+                s.dependency 'base_testing'
+                test_spec do |ts|
+                  ts.dependency 'base_testing'
+                end
+              end
+
+              pod 'base_testing' do |s|
+                s.dependency 'base'
+                test_spec do |ts|
+                end
+              end
+
+              pod 'app_host' do |s|
+                s.dependency 'base'
+                app_spec do |as|
+                  as.dependency 'd'
+                end
+                test_spec do |ts|
+                  ts.requires_app_host = true
+                  ts.app_host_name = 'app_host/App'
+                  ts.dependency 'app_host/App'
+                end
+              end
+            end
+            config.verbose = true
+
+            @analyzer = Pod::Installer::Analyzer.new(config.sandbox, @podfile, nil)
+            @analyzer.stubs(:sources).returns([source])
+            result = @analyzer.analyze
+
+            pod_target = result.pod_targets.find { |pt| pt.name == 'a' }
+            test_spec = pod_target.test_specs.find { |ts| ts.name == "#{pod_target.pod_name}/Tests" }
+            pod_target.dependent_targets.map(&:name).sort.should == %w(b base)
+            pod_target.recursive_dependent_targets.map(&:name).sort.should == %w(b base c e)
+            pod_target.test_dependent_targets_by_spec_name.map { |k, v| [k, v.map(&:name)] }.should == [['a/Tests', ['a_testing']]]
+            pod_target.app_dependent_targets_by_spec_name.map { |k, v| [k, v.map(&:name)] }.should == []
+            pod_target.recursive_test_dependent_targets(test_spec).map(&:name).sort.should == %w(a a_testing b base base_testing c e)
+            pod_target.test_app_hosts_by_spec.should == {}
+
+            pod_target = result.pod_targets.find { |pt| pt.name == 'a_testing' }
+            pod_target.dependent_targets.map(&:name).sort.should == %w(a base_testing)
+            pod_target.recursive_dependent_targets.map(&:name).sort.should == %w(a b base base_testing c e)
+            pod_target.test_dependent_targets_by_spec_name.map { |k, v| [k, v.map(&:name)] }.should == []
+            pod_target.app_dependent_targets_by_spec_name.map { |k, v| [k, v.map(&:name)] }.should == []
+            pod_target.test_app_hosts_by_spec.should == {}
+
+            pod_target = result.pod_targets.find { |pt| pt.name == 'b' }
+            test_spec = pod_target.test_specs.find { |ts| ts.name == "#{pod_target.pod_name}/Tests" }
+            pod_target.dependent_targets.map(&:name).sort.should == ['c']
+            pod_target.recursive_dependent_targets.map(&:name).sort.should == %w(base c e)
+            pod_target.test_dependent_targets_by_spec_name.map { |k, v| [k, v.map(&:name)] }.should == [['b/Tests', []]]
+            pod_target.recursive_test_dependent_targets(test_spec).map(&:name).sort.should == []
+            pod_target.app_dependent_targets_by_spec_name.map { |k, v| [k, v.map(&:name)] }.should == []
+            pod_target.test_app_hosts_by_spec.should == {}
+
+            pod_target = result.pod_targets.find { |pt| pt.name == 'base' }
+            pod_target.dependent_targets.map(&:name).sort.should == []
+            pod_target.recursive_dependent_targets.map(&:name).sort.should == []
+            pod_target.test_dependent_targets_by_spec_name.map { |k, v| [k, v.map(&:name)] }.should == []
+            pod_target.app_dependent_targets_by_spec_name.map { |k, v| [k, v.map(&:name)] }.should == []
+            pod_target.test_app_hosts_by_spec.should == {}
+
+            pod_target = result.pod_targets.find { |pt| pt.name == 'c' }
+            test_spec = pod_target.test_specs.find { |ts| ts.name == "#{pod_target.pod_name}/Tests" }
+            pod_target.dependent_targets.map(&:name).sort.should == ['e']
+            pod_target.recursive_dependent_targets.map(&:name).sort.should == %w(base e)
+            pod_target.test_dependent_targets_by_spec_name.map { |k, v| [k, v.map(&:name)] }.should == [['c/Tests', ['a_testing']]]
+            pod_target.recursive_test_dependent_targets(test_spec).map(&:name).sort.should == %w(a a_testing b base base_testing c e)
+            pod_target.app_dependent_targets_by_spec_name.map { |k, v| [k, v.map(&:name)] }.should == []
+            pod_target.test_app_hosts_by_spec.map { |k, v| [k.name, v.map(&:name)] }.should == [['c/Tests', ['app_host/App', 'app_host']]]
+
+            pod_target = result.pod_targets.find { |pt| pt.name == 'd' }
+            test_spec = pod_target.test_specs.find { |ts| ts.name == "#{pod_target.pod_name}/Tests" }
+            pod_target.dependent_targets.map(&:name).sort.should == ['a']
+            pod_target.recursive_dependent_targets.map(&:name).sort.should == %w(a b base c e)
+            pod_target.test_dependent_targets_by_spec_name.map { |k, v| [k, v.map(&:name)] }.should == [['d/Tests', ['b']]]
+            pod_target.recursive_test_dependent_targets(test_spec).map(&:name).sort.should == %w(b base c e)
+            pod_target.app_dependent_targets_by_spec_name.map { |k, v| [k, v.map(&:name)] }.should == []
+            pod_target.test_app_hosts_by_spec.should == {}
+
+            pod_target = result.pod_targets.find { |pt| pt.name == 'e' }
+            pod_target.dependent_targets.map(&:name).sort.should == ['base']
+            pod_target.recursive_dependent_targets.map(&:name).sort.should == ['base']
+            pod_target.test_dependent_targets_by_spec_name.map { |k, v| [k, v.map(&:name)] }.should == []
+            pod_target.app_dependent_targets_by_spec_name.map { |k, v| [k, v.map(&:name)] }.should == []
+            pod_target.test_app_hosts_by_spec.should == {}
+
+            pod_target = result.pod_targets.find { |pt| pt.name == 'app_host' }
+            test_spec = pod_target.test_specs.find { |ts| ts.name == "#{pod_target.pod_name}/Tests" }
+            app_spec = pod_target.app_specs.find { |as| as.name == "#{pod_target.pod_name}/App" }
+            pod_target.dependent_targets.map(&:name).sort.should == ['base']
+            pod_target.recursive_dependent_targets.map(&:name).sort.should == ['base']
+            pod_target.test_dependent_targets_by_spec_name.map { |k, v| [k, v.map(&:name)] }.should == [['app_host/Tests', []]]
+            pod_target.recursive_test_dependent_targets(test_spec).map(&:name).sort.should == []
+            pod_target.app_dependent_targets_by_spec_name.map { |k, v| [k, v.map(&:name)] }.should == [['app_host/App', ['d']]]
+            pod_target.recursive_app_dependent_targets(app_spec).map(&:name).sort.should == %w(a b base c d e)
+            pod_target.test_app_hosts_by_spec.map { |k, v| [k.name, v.map(&:name)] }.should == [['app_host/Tests', ['app_host/App', 'app_host']]]
+          end
+
+          it 'correctly computes recursive dependent targets for scoped pod targets' do
+            @podfile = Pod::Podfile.new do
+              project 'SampleProject/SampleProject'
+
+              pod 'a', :testspecs => %w(Tests)
+              pod 'b', :testspecs => %w(Tests)
+              pod 'c', :testspecs => %w(Tests)
+              pod 'd', :testspecs => %w(Tests)
+              pod 'app_host', :testspecs => %w(Tests)
+              pod 'base'
+
+              target 'SampleProject' do
+                platform :ios, '10.0'
+              end
+
+              target 'CLITool' do
+                platform :osx, '10.14'
+              end
+            end
+
+            source = MockSource.new 'Source' do
+              pod 'base' do
+                test_spec do |ts|
+                  ts.dependency 'base_testing'
+                end
+              end
+
+              pod 'a' do |s|
+                s.dependency 'b'
+                s.dependency 'base'
+                test_spec do |ts|
+                  ts.dependency 'a_testing'
+                end
+              end
+
+              pod 'b' do |s|
+                s.dependency 'c'
+                test_spec do |ts|
+                end
+              end
+
+              pod 'c' do |s|
+                s.dependency 'e'
+                test_spec do |ts|
+                  ts.dependency 'a_testing'
+
+                  ts.requires_app_host = true
+                  ts.app_host_name = 'app_host/App'
+                  ts.dependency 'app_host/App'
+                end
+              end
+
+              pod 'd' do |s|
+                s.dependency 'a'
+                test_spec do |ts|
+                  ts.dependency 'b'
+                end
+              end
+
+              pod 'e' do |s|
+                s.dependency 'base'
+                test_spec do |ts|
+                end
+              end
+
+              pod 'a_testing' do |s|
+                s.dependency 'a'
+                s.dependency 'base_testing'
+                test_spec do |ts|
+                  ts.dependency 'base_testing'
+                end
+              end
+
+              pod 'base_testing' do |s|
+                s.dependency 'base'
+                test_spec do |ts|
+                end
+              end
+
+              pod 'app_host' do |s|
+                s.dependency 'base'
+                app_spec do |as|
+                  as.dependency 'd'
+                end
+                test_spec do |ts|
+                  ts.requires_app_host = true
+                  ts.app_host_name = 'app_host/App'
+                  ts.dependency 'app_host/App'
+                end
+              end
+            end
+
+            @analyzer = Pod::Installer::Analyzer.new(config.sandbox, @podfile, nil, [], true, false, @sources_manager)
+            @analyzer.stubs(:sources).returns([source])
+            result = @analyzer.analyze
+
+            %w(-macOS -iOS).each do |scope|
+              pod_target = result.pod_targets.find { |pt| pt.name == 'a' + scope }
+              test_spec = pod_target.test_specs.find { |ts| ts.name == "#{pod_target.pod_name}/Tests" }
+              pod_target.dependent_targets.map(&:name).sort.should == %w(b base).map { |n| n + scope }
+              pod_target.recursive_dependent_targets.map(&:name).sort.should == %w(b base c e).map { |n| n + scope }
+              pod_target.test_dependent_targets_by_spec_name.map { |k, v| [k, v.map(&:name)] }.should == [['a/Tests', ['a_testing'].map { |n| n + scope }]]
+              pod_target.app_dependent_targets_by_spec_name.map { |k, v| [k, v.map(&:name)] }.should == []
+              pod_target.recursive_test_dependent_targets(test_spec).map(&:name).sort.should == %w(a a_testing b base base_testing c e).map { |n| n + scope }
+              pod_target.test_app_hosts_by_spec.should == {}
+
+              pod_target = result.pod_targets.find { |pt| pt.name == 'a_testing' + scope }
+              pod_target.dependent_targets.map(&:name).sort.should == %w(a base_testing).map { |n| n + scope }
+              pod_target.recursive_dependent_targets.map(&:name).sort.should == %w(a b base base_testing c e).map { |n| n + scope }
+              pod_target.test_dependent_targets_by_spec_name.map { |k, v| [k, v.map(&:name)] }.should == []
+              pod_target.app_dependent_targets_by_spec_name.map { |k, v| [k, v.map(&:name)] }.should == []
+              pod_target.test_app_hosts_by_spec.should == {}
+
+              pod_target = result.pod_targets.find { |pt| pt.name == 'b' + scope }
+              test_spec = pod_target.test_specs.find { |ts| ts.name == "#{pod_target.pod_name}/Tests" }
+              pod_target.dependent_targets.map(&:name).sort.should == ['c'].map { |n| n + scope }
+              pod_target.recursive_dependent_targets.map(&:name).sort.should == %w(base c e).map { |n| n + scope }
+              pod_target.test_dependent_targets_by_spec_name.map { |k, v| [k, v.map(&:name)] }.should == [['b/Tests', []]]
+              pod_target.recursive_test_dependent_targets(test_spec).map(&:name).sort.should == []
+              pod_target.app_dependent_targets_by_spec_name.map { |k, v| [k, v.map(&:name)] }.should == []
+              pod_target.test_app_hosts_by_spec.should == {}
+
+              pod_target = result.pod_targets.find { |pt| pt.name == 'base' + scope }
+              pod_target.dependent_targets.map(&:name).sort.should == []
+              pod_target.recursive_dependent_targets.map(&:name).sort.should == []
+              pod_target.test_dependent_targets_by_spec_name.map { |k, v| [k, v.map(&:name)] }.should == []
+              pod_target.app_dependent_targets_by_spec_name.map { |k, v| [k, v.map(&:name)] }.should == []
+              pod_target.test_app_hosts_by_spec.should == {}
+
+              pod_target = result.pod_targets.find { |pt| pt.name == 'c' + scope }
+              test_spec = pod_target.test_specs.find { |ts| ts.name == "#{pod_target.pod_name}/Tests" }
+              pod_target.dependent_targets.map(&:name).sort.should == ['e'].map { |n| n + scope }
+              pod_target.recursive_dependent_targets.map(&:name).sort.should == %w(base e).map { |n| n + scope }
+              pod_target.test_dependent_targets_by_spec_name.map { |k, v| [k, v.map(&:name)] }.should == [['c/Tests', ['a_testing'].map { |n| n + scope }]]
+              pod_target.recursive_test_dependent_targets(test_spec).map(&:name).sort.should == %w(a a_testing b base base_testing c e).map { |n| n + scope }
+              pod_target.app_dependent_targets_by_spec_name.map { |k, v| [k, v.map(&:name)] }.should == []
+              pod_target.test_app_hosts_by_spec.map { |k, v| [k.name, v.map(&:name)] }.should == [['c/Tests', ['app_host/App', 'app_host' + scope]]]
+
+              pod_target = result.pod_targets.find { |pt| pt.name == 'd' + scope }
+              test_spec = pod_target.test_specs.find { |ts| ts.name == "#{pod_target.pod_name}/Tests" }
+              pod_target.dependent_targets.map(&:name).sort.should == ['a'].map { |n| n + scope }
+              pod_target.recursive_dependent_targets.map(&:name).sort.should == %w(a b base c e).map { |n| n + scope }
+              pod_target.test_dependent_targets_by_spec_name.map { |k, v| [k, v.map(&:name)] }.should == [['d/Tests', ['b'].map { |n| n + scope }]]
+              pod_target.recursive_test_dependent_targets(test_spec).map(&:name).sort.should == %w(b base c e).map { |n| n + scope }
+              pod_target.app_dependent_targets_by_spec_name.map { |k, v| [k, v.map(&:name)] }.should == []
+              pod_target.test_app_hosts_by_spec.should == {}
+
+              pod_target = result.pod_targets.find { |pt| pt.name == 'e' + scope }
+              pod_target.dependent_targets.map(&:name).sort.should == ['base'].map { |n| n + scope }
+              pod_target.recursive_dependent_targets.map(&:name).sort.should == ['base'].map { |n| n + scope }
+              pod_target.test_dependent_targets_by_spec_name.map { |k, v| [k, v.map(&:name)] }.should == []
+              pod_target.app_dependent_targets_by_spec_name.map { |k, v| [k, v.map(&:name)] }.should == []
+              pod_target.test_app_hosts_by_spec.should == {}
+
+              pod_target = result.pod_targets.find { |pt| pt.name == 'app_host' + scope }
+              test_spec = pod_target.test_specs.find { |ts| ts.name == "#{pod_target.pod_name}/Tests" }
+              app_spec = pod_target.app_specs.find { |as| as.name == "#{pod_target.pod_name}/App" }
+              pod_target.dependent_targets.map(&:name).sort.should == ['base'].map { |n| n + scope }
+              pod_target.recursive_dependent_targets.map(&:name).sort.should == ['base'].map { |n| n + scope }
+              pod_target.test_dependent_targets_by_spec_name.map { |k, v| [k, v.map(&:name)] }.should == [['app_host/Tests', []]]
+              pod_target.recursive_test_dependent_targets(test_spec).map(&:name).sort.should == []
+              pod_target.app_dependent_targets_by_spec_name.map { |k, v| [k, v.map(&:name)] }.should == [['app_host/App', ['d'].map { |n| n + scope }]]
+              pod_target.recursive_app_dependent_targets(app_spec).map(&:name).sort.should == %w(a b base c d e).map { |n| n + scope }
+              pod_target.test_app_hosts_by_spec.map { |k, v| [k.name, v.map(&:name)] }.should == [['app_host/Tests', ['app_host/App', 'app_host' + scope]]]
+            end
+          end
+
+          it 'picks the right variants up when there are multiple' do
+            @podfile = Pod::Podfile.new do
+              source SpecHelper.test_repo_url
+              platform :ios, '8.0'
+              project 'SampleProject/SampleProject'
+
+              # The order of target definitions is important for this test.
+              target 'TestRunner' do
+                pod 'OrangeFramework'
+                pod 'matryoshka/Foo'
+              end
+
+              target 'SampleProject' do
+                pod 'OrangeFramework'
+              end
+            end
+            @analyzer = Pod::Installer::Analyzer.new(config.sandbox, @podfile, nil, [], true, false, @sources_manager)
+            result = @analyzer.analyze
+
+            result.targets.count.should == 2
+
+            pod_target = result.targets[0].pod_targets.find { |pt| pt.pod_name == 'OrangeFramework' }
+            pod_target.dependent_targets.count == 1
+            pod_target.dependent_targets.first.specs.map(&:name).should == %w(
+              matryoshka
+              matryoshka/Outer
+              matryoshka/Outer/Inner
+            )
+          end
+
+          it 'picks the right dependencies across different variants' do
+            @podfile = Pod::Podfile.new do
+              source SpecHelper.test_repo_url
+              project 'SampleProject/SampleProject'
+
+              target 'TestRunner' do
+                platform :ios, '8.0'
+                pod 'OrangeFramework'
+              end
+
+              target 'SampleProject' do
+                platform :ios, '9.0'
+                pod 'OrangeFramework'
+              end
+            end
+            @analyzer = Pod::Installer::Analyzer.new(config.sandbox, @podfile, nil, [], true, false, @sources_manager)
+            result = @analyzer.analyze
+            result.targets.count.should == 2
+
+            pod_target_ios8 = result.targets[0].pod_targets.find { |pt| pt.label == 'OrangeFramework-iOS8.0' }
+            pod_target_ios8.dependent_targets.count == 1
+            pod_target_ios8.dependent_targets.map(&:label).should == %w(
+              matryoshka-iOS8.0
+            )
+
+            pod_target_ios9 = result.targets[1].pod_targets.find { |pt| pt.label == 'OrangeFramework-iOS9.0' }
+            pod_target_ios9.dependent_targets.count == 1
+            pod_target_ios9.dependent_targets.map(&:label).should == %w(
+              matryoshka-iOS9.0
+            )
+          end
+
+          it 'does not create multiple variants across different targets that require different set of testspecs' do
+            @podfile = Pod::Podfile.new do
+              source SpecHelper.test_repo_url
+              platform :ios, '8.0'
+              project 'SampleProject/SampleProject'
+
+              target 'TestRunner' do
+                pod 'CoconutLib', :testspecs => ['Tests']
+              end
+
+              target 'SampleProject' do
+                pod 'CoconutLib'
+              end
+            end
+            @analyzer = Pod::Installer::Analyzer.new(config.sandbox, @podfile, nil, [], true, false, @sources_manager)
+            result = @analyzer.analyze
+
+            result.targets.count.should == 2
+            result.targets[0].pod_targets.count == 1
+            result.targets[0].pod_targets[0].name.should == 'CoconutLib'
+            result.targets[1].pod_targets.count == 1
+            result.targets[1].pod_targets[0].name.should == 'CoconutLib'
+            result.targets[0].pod_targets[0].should == result.targets[1].pod_targets[0]
+          end
+        end
+
+        describe 'with deduplicate targets as false' do
+          before { Installer::InstallationOptions.any_instance.stubs(:deduplicate_targets? => false) }
+
+          it 'picks transitive dependencies up' do
+            @podfile = Pod::Podfile.new do
+              platform :ios, '8.0'
+              project 'SampleProject/SampleProject'
+              pod 'RestKit', '~> 0.23.0'
+              target 'TestRunner' do
+                pod 'RestKit/Testing', '~> 0.23.0'
+              end
+            end
+            @analyzer = Pod::Installer::Analyzer.new(config.sandbox, @podfile, nil, [], true, false, @sources_manager)
+            result = @analyzer.analyze
+            result.targets.count.should == 1
+            target = result.targets.first
+            restkit_target = target.pod_targets.find { |pt| pt.pod_name == 'RestKit' }
+            restkit_target.dependent_targets.map(&:pod_name).sort.should == %w(
+              AFNetworking
+              ISO8601DateFormatterValueTransformer
+              RKValueTransformers
+              SOCKit
+              TransitionKit
+            )
+            restkit_target.recursive_dependent_targets.map(&:pod_name).sort.should == %w(
+              AFNetworking
+              ISO8601DateFormatterValueTransformer
+              RKValueTransformers
+              SOCKit
+              TransitionKit
+            )
+            restkit_target.dependent_targets.all?(&:scoped).should.be.true
+          end
+
+          it 'does not mark transitive dependencies as dependent targets' do
+            @podfile = Pod::Podfile.new do
+              platform :ios, '8.0'
+              project 'SampleProject/SampleProject'
+              target 'SampleProject'
+              pod 'Firebase', '3.9.0'
+              pod 'ARAnalytics', '4.0.0', :subspecs => %w(Firebase)
+            end
+            @analyzer = Pod::Installer::Analyzer.new(config.sandbox, @podfile, nil, [], true, false, @sources_manager)
+            result = @analyzer.analyze
+            result.targets.count.should == 1
+            target = result.targets.first
+
+            firebase_target = target.pod_targets.find { |pt| pt.pod_name == 'Firebase' }
+            firebase_target.dependent_targets.map(&:pod_name).sort.should == %w(
+              FirebaseAnalytics FirebaseCore
+            )
+            firebase_target.recursive_dependent_targets.map(&:pod_name).sort.should == %w(
+              FirebaseAnalytics FirebaseCore FirebaseInstanceID GoogleInterchangeUtilities GoogleSymbolUtilities GoogleToolboxForMac
+            )
+            firebase_target.dependent_targets.all?(&:scoped).should.be.true
+
+            aranalytics_target = target.pod_targets.find { |pt| pt.pod_name == 'ARAnalytics' }
+            aranalytics_target.dependent_targets.map(&:pod_name).sort.should == %w(
+              Firebase
+            )
+            aranalytics_target.recursive_dependent_targets.map(&:pod_name).sort.should == %w(
+              Firebase FirebaseAnalytics FirebaseCore FirebaseInstanceID GoogleInterchangeUtilities GoogleSymbolUtilities GoogleToolboxForMac
+            )
+            aranalytics_target.dependent_targets.all?(&:scoped).should.be.true
+          end
+
+          it 'correctly computes recursive dependent targets' do
+            @podfile = Pod::Podfile.new do
+              platform :ios, '10.0'
+              project 'SampleProject/SampleProject'
+
+              # The order of target definitions is important for this test.
+              target 'SampleProject' do
+                pod 'a', :testspecs => %w(Tests)
+                pod 'b', :testspecs => %w(Tests)
+                pod 'c', :testspecs => %w(Tests)
+                pod 'd', :testspecs => %w(Tests)
+                pod 'app_host', :testspecs => %w(Tests)
+                pod 'base'
+              end
+            end
+
+            source = MockSource.new 'Source' do
+              pod 'base' do
+                test_spec do |ts|
+                  ts.dependency 'base_testing'
+                end
+              end
+
+              pod 'a' do |s|
+                s.dependency 'b'
+                s.dependency 'base'
+                test_spec do |ts|
+                  ts.dependency 'a_testing'
+                end
+              end
+
+              pod 'b' do |s|
+                s.dependency 'c'
+                test_spec do |ts|
+                end
+              end
+
+              pod 'c' do |s|
+                s.dependency 'e'
+                test_spec do |ts|
+                  ts.dependency 'a_testing'
+
+                  ts.requires_app_host = true
+                  ts.app_host_name = 'app_host/App'
+                  ts.dependency 'app_host/App'
+                end
+              end
+
+              pod 'd' do |s|
+                s.dependency 'a'
+                test_spec do |ts|
+                  ts.dependency 'b'
+                end
+              end
+
+              pod 'e' do |s|
+                s.dependency 'base'
+                test_spec do |ts|
+                end
+              end
+
+              pod 'a_testing' do |s|
+                s.dependency 'a'
+                s.dependency 'base_testing'
+                test_spec do |ts|
+                  ts.dependency 'base_testing'
+                end
+              end
+
+              pod 'base_testing' do |s|
+                s.dependency 'base'
+                test_spec do |ts|
+                end
+              end
+
+              pod 'app_host' do |s|
+                s.dependency 'base'
+                app_spec do |as|
+                  as.dependency 'd'
+                end
+                test_spec do |ts|
+                  ts.requires_app_host = true
+                  ts.app_host_name = 'app_host/App'
+                  ts.dependency 'app_host/App'
+                end
+              end
+            end
+
+            @analyzer = Pod::Installer::Analyzer.new(config.sandbox, @podfile, nil, [], true, false, @sources_manager)
+            @analyzer.stubs(:sources).returns([source])
+            result = @analyzer.analyze
+
+            pod_target = result.pod_targets.find { |pt| pt.name == 'a-Pods-SampleProject' }
+            test_spec = pod_target.test_specs.find { |ts| ts.name == "#{pod_target.pod_name}/Tests" }
+            pod_target.dependent_targets.map(&:name).sort.should == %w(b base).map { |n| n + '-Pods-SampleProject' }
+            pod_target.recursive_dependent_targets.map(&:name).sort.should == %w(b base c e).map { |n| n + '-Pods-SampleProject' }
+            pod_target.test_dependent_targets_by_spec_name.map { |k, v| [k, v.map(&:name)] }.should == [['a/Tests', ['a_testing'].map { |n| n + '-Pods-SampleProject' }]]
+            pod_target.app_dependent_targets_by_spec_name.map { |k, v| [k, v.map(&:name)] }.should == []
+            pod_target.recursive_test_dependent_targets(test_spec).map(&:name).sort.should == %w(a a_testing b base base_testing c e).map { |n| n + '-Pods-SampleProject' }
+            pod_target.test_app_hosts_by_spec.should == {}
+
+            pod_target = result.pod_targets.find { |pt| pt.name == 'a_testing-Pods-SampleProject' }
+            pod_target.dependent_targets.map(&:name).sort.should == %w(a base_testing).map { |n| n + '-Pods-SampleProject' }
+            pod_target.recursive_dependent_targets.map(&:name).sort.should == %w(a b base base_testing c e).map { |n| n + '-Pods-SampleProject' }
+            pod_target.test_dependent_targets_by_spec_name.map { |k, v| [k, v.map(&:name)] }.should == []
+            pod_target.app_dependent_targets_by_spec_name.map { |k, v| [k, v.map(&:name)] }.should == []
+            pod_target.test_app_hosts_by_spec.should == {}
+
+            pod_target = result.pod_targets.find { |pt| pt.name == 'b-Pods-SampleProject' }
+            test_spec = pod_target.test_specs.find { |ts| ts.name == "#{pod_target.pod_name}/Tests" }
+            pod_target.dependent_targets.map(&:name).sort.should == ['c'].map { |n| n + '-Pods-SampleProject' }
+            pod_target.recursive_dependent_targets.map(&:name).sort.should == %w(base c e).map { |n| n + '-Pods-SampleProject' }
+            pod_target.test_dependent_targets_by_spec_name.map { |k, v| [k, v.map(&:name)] }.should == [['b/Tests', []]]
+            pod_target.recursive_test_dependent_targets(test_spec).map(&:name).sort.should == []
+            pod_target.app_dependent_targets_by_spec_name.map { |k, v| [k, v.map(&:name)] }.should == []
+            pod_target.test_app_hosts_by_spec.should == {}
+
+            pod_target = result.pod_targets.find { |pt| pt.name == 'base-Pods-SampleProject' }
+            pod_target.dependent_targets.map(&:name).sort.should == []
+            pod_target.recursive_dependent_targets.map(&:name).sort.should == []
+            pod_target.test_dependent_targets_by_spec_name.map { |k, v| [k, v.map(&:name)] }.should == []
+            pod_target.app_dependent_targets_by_spec_name.map { |k, v| [k, v.map(&:name)] }.should == []
+            pod_target.test_app_hosts_by_spec.should == {}
+
+            pod_target = result.pod_targets.find { |pt| pt.name == 'c-Pods-SampleProject' }
+            test_spec = pod_target.test_specs.find { |ts| ts.name == "#{pod_target.pod_name}/Tests" }
+            pod_target.dependent_targets.map(&:name).sort.should == ['e'].map { |n| n + '-Pods-SampleProject' }
+            pod_target.recursive_dependent_targets.map(&:name).sort.should == %w(base e).map { |n| n + '-Pods-SampleProject' }
+            pod_target.test_dependent_targets_by_spec_name.map { |k, v| [k, v.map(&:name)] }.should == [['c/Tests', ['a_testing'].map { |n| n + '-Pods-SampleProject' }]]
+            pod_target.recursive_test_dependent_targets(test_spec).map(&:name).sort.should == %w(a a_testing b base base_testing c e).map { |n| n + '-Pods-SampleProject' }
+            pod_target.app_dependent_targets_by_spec_name.map { |k, v| [k, v.map(&:name)] }.should == []
+            pod_target.test_app_hosts_by_spec.map { |k, v| [k.name, v.map(&:name)] }.should == [['c/Tests', ['app_host/App', 'app_host-Pods-SampleProject']]]
+
+            pod_target = result.pod_targets.find { |pt| pt.name == 'd-Pods-SampleProject' }
+            test_spec = pod_target.test_specs.find { |ts| ts.name == "#{pod_target.pod_name}/Tests" }
+            pod_target.dependent_targets.map(&:name).sort.should == ['a'].map { |n| n + '-Pods-SampleProject' }
+            pod_target.recursive_dependent_targets.map(&:name).sort.should == %w(a b base c e).map { |n| n + '-Pods-SampleProject' }
+            pod_target.test_dependent_targets_by_spec_name.map { |k, v| [k, v.map(&:name)] }.should == [['d/Tests', ['b'].map { |n| n + '-Pods-SampleProject' }]]
+            pod_target.recursive_test_dependent_targets(test_spec).map(&:name).sort.should == %w(b base c e).map { |n| n + '-Pods-SampleProject' }
+            pod_target.app_dependent_targets_by_spec_name.map { |k, v| [k, v.map(&:name)] }.should == []
+            pod_target.test_app_hosts_by_spec.should == {}
+
+            pod_target = result.pod_targets.find { |pt| pt.name == 'e-Pods-SampleProject' }
+            pod_target.dependent_targets.map(&:name).sort.should == ['base'].map { |n| n + '-Pods-SampleProject' }
+            pod_target.recursive_dependent_targets.map(&:name).sort.should == ['base'].map { |n| n + '-Pods-SampleProject' }
+            pod_target.test_dependent_targets_by_spec_name.map { |k, v| [k, v.map(&:name)] }.should == []
+            pod_target.app_dependent_targets_by_spec_name.map { |k, v| [k, v.map(&:name)] }.should == []
+            pod_target.test_app_hosts_by_spec.should == {}
+
+            pod_target = result.pod_targets.find { |pt| pt.name == 'app_host-Pods-SampleProject' }
+            test_spec = pod_target.test_specs.find { |ts| ts.name == "#{pod_target.pod_name}/Tests" }
+            app_spec = pod_target.app_specs.find { |as| as.name == "#{pod_target.pod_name}/App" }
+            pod_target.dependent_targets.map(&:name).sort.should == ['base'].map { |n| n + '-Pods-SampleProject' }
+            pod_target.recursive_dependent_targets.map(&:name).sort.should == ['base'].map { |n| n + '-Pods-SampleProject' }
+            pod_target.test_dependent_targets_by_spec_name.map { |k, v| [k, v.map(&:name)] }.should == [['app_host/Tests', []]]
+            pod_target.recursive_test_dependent_targets(test_spec).map(&:name).sort.should == []
+            pod_target.app_dependent_targets_by_spec_name.map { |k, v| [k, v.map(&:name)] }.should == [['app_host/App', ['d'].map { |n| n + '-Pods-SampleProject' }]]
+            pod_target.recursive_app_dependent_targets(app_spec).map(&:name).sort.should == %w(a b base c d e).map { |n| n + '-Pods-SampleProject' }
+            pod_target.test_app_hosts_by_spec.map { |k, v| [k.name, v.map(&:name)] }.should == [['app_host/Tests', ['app_host/App', 'app_host-Pods-SampleProject']]]
+          end
+
+          it 'picks the right variants up when there are multiple' do
+            @podfile = Pod::Podfile.new do
+              source SpecHelper.test_repo_url
+              platform :ios, '8.0'
+              project 'SampleProject/SampleProject'
+
+              # The order of target definitions is important for this test.
+              target 'TestRunner' do
+                pod 'OrangeFramework'
+                pod 'matryoshka/Foo'
+              end
+
+              target 'SampleProject' do
+                pod 'OrangeFramework'
+              end
+            end
+            @analyzer = Pod::Installer::Analyzer.new(config.sandbox, @podfile, nil, [], true, false, @sources_manager)
+            result = @analyzer.analyze
+
+            result.targets.count.should == 2
+
+            pod_target = result.targets[0].pod_targets.find { |pt| pt.pod_name == 'OrangeFramework' }
+            pod_target.dependent_targets.count == 1
+            pod_target.dependent_targets.first.specs.map(&:name).should == %w(
+              matryoshka
+              matryoshka/Foo
+              matryoshka/Outer
+              matryoshka/Outer/Inner
+            )
+
+            pod_target = result.targets[1].pod_targets.find { |pt| pt.pod_name == 'OrangeFramework' }
+            pod_target.dependent_targets.count == 1
+            pod_target.dependent_targets.first.specs.map(&:name).should == %w(
+              matryoshka
+              matryoshka/Outer
+              matryoshka/Outer/Inner
+            )
+          end
+
+          it 'does not create multiple variants across different targets that require different set of testspecs' do
+            @podfile = Pod::Podfile.new do
+              source SpecHelper.test_repo_url
+              platform :ios, '8.0'
+              project 'SampleProject/SampleProject'
+
+              target 'TestRunner' do
+                pod 'CoconutLib', :testspecs => ['Tests']
+              end
+
+              target 'SampleProject' do
+                pod 'CoconutLib'
+              end
+            end
+            @analyzer = Pod::Installer::Analyzer.new(config.sandbox, @podfile, nil, [], true, false, @sources_manager)
+            result = @analyzer.analyze
+
+            result.targets.count.should == 2
+            result.targets[0].pod_targets.count == 1
+            result.targets[0].pod_targets[0].name.should == 'CoconutLib-Pods-TestRunner'
+            result.targets[1].pod_targets.count == 1
+            result.targets[1].pod_targets[0].name.should == 'CoconutLib-Pods-SampleProject'
+          end
+
+          it 'sets the correct swift version' do
+            @podfile = Pod::Podfile.new do
+              source SpecHelper.test_repo_url
+              platform :ios, '8.0'
+              project 'SampleProject/SampleProject'
+
+              target 'SampleProject' do
+                pod 'MultiSwift'
+              end
+            end
+            @analyzer = Pod::Installer::Analyzer.new(config.sandbox, @podfile, nil, [], true, false, @sources_manager)
+            result = @analyzer.analyze
+
+            result.targets.count.should == 1
+            result.targets[0].pod_targets.count == 1
+            result.targets[0].pod_targets[0].name.should == 'MultiSwift-Pods-SampleProject'
+            result.targets[0].pod_targets[0].swift_version.should == '4.0'
+          end
+
+          it 'sets the correct swift version given podfile requirements' do
+            @podfile = Pod::Podfile.new do
+              source SpecHelper.test_repo_url
+              platform :ios, '8.0'
+              supports_swift_versions '< 4.0'
+              project 'SampleProject/SampleProject'
+
+              target 'SampleProject' do
+                pod 'MultiSwift'
+              end
+            end
+            @analyzer = Pod::Installer::Analyzer.new(config.sandbox, @podfile, nil, [], true, false, @sources_manager)
+            result = @analyzer.analyze
+
+            result.targets.count.should == 1
+            result.targets[0].pod_targets.count == 1
+            result.targets[0].pod_targets[0].name.should == 'MultiSwift-Pods-SampleProject'
+            result.targets[0].pod_targets[0].swift_version.should == '3.2'
+          end
         end
       end
 
@@ -270,13 +1222,14 @@ module Pod
             end
           end
           analyzer = Pod::Installer::Analyzer.new(config.sandbox, podfile)
+          analyzer.stubs(:sources_manager).returns(@sources_manager)
           result = analyzer.analyze
 
           pod_targets = result.targets.flat_map(&:pod_targets).uniq
           Hash[pod_targets.map { |t| [t.label, t.target_definitions.map(&:label).sort] }.sort].should == {
             'BananaLib'  => %w(Pods-SampleProject Pods-SampleProject-TestRunner),
             'monkey-iOS' => %w(Pods-SampleProject Pods-SampleProject-TestRunner),
-            'monkey-OSX' => %w(Pods-CLITool),
+            'monkey-macOS' => %w(Pods-CLITool),
           }
         end
 
@@ -296,6 +1249,7 @@ module Pod
             end
           end
           analyzer = Pod::Installer::Analyzer.new(config.sandbox, podfile)
+          analyzer.stubs(:sources_manager).returns(@sources_manager)
           result = analyzer.analyze
 
           pod_targets = result.targets.flat_map(&:pod_targets).uniq.sort_by(&:name)
@@ -324,6 +1278,7 @@ module Pod
             end
           end
           analyzer = Pod::Installer::Analyzer.new(config.sandbox, podfile)
+          analyzer.stubs(:sources_manager).returns(@sources_manager)
           result = analyzer.analyze
 
           result.targets.flat_map { |at| at.pod_targets.map { |pt| "#{at.name}/#{pt.name}" } }.sort.should == %w(
@@ -353,6 +1308,7 @@ module Pod
             end
           end
           analyzer = Pod::Installer::Analyzer.new(config.sandbox, podfile)
+          analyzer.stubs(:sources_manager).returns(@sources_manager)
           result = analyzer.analyze
 
           result.targets.flat_map { |at| at.pod_targets.map { |pt| "#{at.name}/#{pt.name}" } }.sort.should == %w(
@@ -374,16 +1330,12 @@ module Pod
         target.user_target_uuids.should == []
         target.user_build_configurations.should == { 'Release' => :release, 'Debug' => :debug }
         target.platform.to_s.should == 'iOS 6.0'
+
+        pod_target = target.pod_targets.first
+        pod_target.user_build_configurations.should == { 'Release' => :release, 'Debug' => :debug }
       end
 
       describe 'no-integrate platform validation' do
-        before do
-          repos = [Source.new(fixture('spec-repos/test_repo'))]
-          aggregate = Pod::Source::Aggregate.new(repos)
-          config.sources_manager.stubs(:aggregate).returns(aggregate)
-          aggregate.sources.first.stubs(:url).returns(SpecHelper.test_repo_url)
-        end
-
         it 'does not require a platform for an empty target' do
           podfile = Pod::Podfile.new do
             install! 'cocoapods', :integrate_targets => false
@@ -396,6 +1348,7 @@ module Pod
           end
 
           analyzer = Pod::Installer::Analyzer.new(config.sandbox, podfile)
+          analyzer.stubs(:sources_manager).returns(@sources_manager)
           lambda { analyzer.analyze }.should.not.raise
         end
 
@@ -411,6 +1364,7 @@ module Pod
           end
 
           analyzer = Pod::Installer::Analyzer.new(config.sandbox, podfile)
+          analyzer.stubs(:sources_manager).returns(@sources_manager)
           lambda { analyzer.analyze }.should.not.raise
         end
 
@@ -425,6 +1379,7 @@ module Pod
           end
 
           analyzer = Pod::Installer::Analyzer.new(config.sandbox, podfile)
+          analyzer.stubs(:sources_manager).returns(@sources_manager)
           lambda { analyzer.analyze }.should.raise Informative
         end
       end
@@ -444,22 +1399,31 @@ module Pod
       #--------------------------------------#
 
       it 'locks the version of the dependencies which did not change in the Podfile' do
-        @analyzer.analyze
-        @analyzer.send(:locked_dependencies).map(&:payload).map(&:to_s).
-          should == ['JSONKit (= 1.5pre)', 'SVPullToRefresh (= 0.4)']
+        podfile_state = @analyzer.send(:generate_podfile_state)
+        @analyzer.send(:generate_version_locking_dependencies, podfile_state).map(&:payload).map(&:to_s).should ==
+            ['JSONKit (= 1.5pre)', 'SVPullToRefresh (= 0.4)']
       end
 
       it 'does not lock the dependencies in update mode' do
-        @analyzer.update = true
-        @analyzer.analyze
-        @analyzer.send(:locked_dependencies).to_a.map(&:payload).should == []
+        @analyzer.stubs(:pods_to_update).returns(true)
+        podfile_state = @analyzer.send(:generate_podfile_state)
+        @analyzer.send(:generate_version_locking_dependencies, podfile_state).to_a.map(&:payload).should == []
       end
 
       it 'unlocks dependencies in a case-insensitive manner' do
-        @analyzer.update = { :pods => %w(JSONKit) }
-        @analyzer.analyze
-        @analyzer.send(:locked_dependencies).map(&:payload).map(&:to_s).
-          should == ['SVPullToRefresh (= 0.4)']
+        @analyzer.stubs(:pods_to_update).returns(:pods => %w(JSONKit))
+        podfile_state = @analyzer.send(:generate_podfile_state)
+        @analyzer.send(:generate_version_locking_dependencies, podfile_state).map(&:payload).map(&:to_s).should ==
+            ['SVPullToRefresh (= 0.4)']
+      end
+
+      it 'unlocks dependencies when the local spec does not exist' do
+        @analyzer.stubs(:pods_to_update).returns(:pods => %w(JSONKit))
+        @analyzer.stubs(:podfile_dependencies).returns [Dependency.new('foo', :path => 'Foo.podspec')]
+        config.sandbox.stubs(:specification).returns(nil)
+        podfile_state = @analyzer.send(:generate_podfile_state)
+        @analyzer.send(:generate_version_locking_dependencies, podfile_state).map(&:payload).map(&:to_s).should ==
+            ['SVPullToRefresh (= 0.4)']
       end
 
       it 'unlocks all dependencies with the same root name in update mode' do
@@ -486,17 +1450,17 @@ module Pod
         hash['SPEC CHECKSUMS'] = {}
         hash['COCOAPODS'] = Pod::VERSION
         lockfile = Pod::Lockfile.new(hash)
-        analyzer = Installer::Analyzer.new(config.sandbox, podfile, lockfile)
+        analyzer = Installer::Analyzer.new(config.sandbox, podfile, lockfile, nil, true, :pods => %w(AFNetworking))
 
-        analyzer.update = { :pods => %w(AFNetworking) }
         analyzer.analyze.specifications.
           find { |s| s.name == 'AFNetworking' }.
-          version.to_s.should == '2.6.3'
+          version.to_s.should == '2.7.0'
       end
 
       it 'unlocks only local pod when specification checksum changes' do
         sandbox = config.sandbox
-        local_spec = Specification.from_hash('name' => 'LocalPod', 'version' => '1.1', 'dependencies' => { 'Expecta' => ['~> 0.0'] })
+        spec_hash = { 'name' => 'LocalPod', 'version' => '1.1', 'dependencies' => { 'Expecta' => ['~> 0.0'] } }
+        local_spec = Specification.from_hash(spec_hash)
         sandbox.stubs(:specification).with('LocalPod').returns(local_spec)
         podfile = Podfile.new do
           platform :ios, '8.0'
@@ -523,7 +1487,8 @@ module Pod
 
       it 'raises if change in local pod specification conflicts with lockfile' do
         sandbox = config.sandbox
-        local_spec = Specification.from_hash('name' => 'LocalPod', 'version' => '1.0', 'dependencies' => { 'Expecta' => ['0.2.2'] })
+        spec_hash = { 'name' => 'LocalPod', 'version' => '1.0', 'dependencies' => { 'Expecta' => ['0.2.2'] } }
+        local_spec = Specification.from_hash(spec_hash)
         sandbox.stubs(:specification).with('LocalPod').returns(local_spec)
         podfile = Podfile.new do
           platform :ios, '8.0'
@@ -543,6 +1508,32 @@ module Pod
         should.raise(Informative) do
           analyzer.analyze(false)
         end.message.should.match /You should run `pod update Expecta`/
+      end
+
+      it 'raises if dependencies need to be fetched but fetching is not allowed' do
+        sandbox = config.sandbox
+        podfile = Podfile.new do
+          platform :ios, '8.0'
+          project 'SampleProject/SampleProject'
+          target 'SampleProject' do
+            pod 'ExternalSourcePod', :podspec => 'ExternalSourcePod.podspec'
+          end
+        end
+
+        hash = {}
+        hash['PODS'] = ['Expecta (0.2.0)', { 'ExternalSourcePod (1.0)' => ['Expecta (=0.2.0)'] }]
+        hash['DEPENDENCIES'] = ['ExternalSourcePod (from `ExternalSourcePod.podspec`)']
+        hash['EXTERNAL SOURCES'] = { 'ExternalSourcePod' => { :podspec => 'ExternalSourcePod.podspec' } }
+        hash['SPEC CHECKSUMS'] = { 'ExternalSourcePod' => 'DUMMY_CHECKSUM' }
+        hash['COCOAPODS'] = Pod::VERSION
+        lockfile = Lockfile.new(hash)
+
+        analyzer = Installer::Analyzer.new(sandbox, podfile, lockfile)
+        error = should.raise(Informative) do
+          analyzer.analyze(false)
+        end
+        error.message.should.include \
+          'Cannot analyze without fetching dependencies since the sandbox is not up-to-date. Run `pod install` to ensure all dependencies have been fetched.'
       end
 
       #--------------------------------------#
@@ -568,47 +1559,70 @@ module Pod
           version.to_s.should == '2.5.1'
       end
 
+      it 'takes into account locked dependency spec repos' do
+        podfile = Podfile.new do
+          platform :ios, '8.0'
+          project 'SampleProject/SampleProject'
+          source 'https://example.com/example/specs.git'
+          source Pod::TrunkSource::TRUNK_REPO_URL
+          target 'SampleProject' do
+            pod 'JSONKit', '1.5pre'
+          end
+        end
+        hash = {}
+        hash['PODS'] = ['JSONKit (1.5pre)']
+        hash['DEPENDENCIES'] = %w(JSONKit)
+        hash['SPEC CHECKSUMS'] = {}
+        hash['SPEC REPOS'] = {
+          Pod::TrunkSource::TRUNK_REPO_URL => ['JSONKit'],
+        }
+        hash['COCOAPODS'] = Pod::VERSION
+        lockfile = Pod::Lockfile.new(hash)
+        analyzer = Installer::Analyzer.new(config.sandbox, podfile, lockfile)
+        analyzer.stubs(:sources_manager).returns(@sources_manager)
+        example_source = MockSource.new 'example-example-specs' do
+          pod 'JSONKit', '1.5pre' do |s|
+            s.dependency 'Nope', '1.0'
+          end
+
+          pod 'Nope', '1.0' do |s|
+            s.ios.deployment_target = '8'
+          end
+        end
+        master_source = analyzer.sources_manager.master.first
+
+        analyzer.stubs(:sources).returns([example_source, master_source])
+        # if we prefered the first source (the default), we also would have resolved Nope
+        analyzer.analyze.specs_by_source.
+          should == {
+            example_source => [],
+            master_source => [Pod::Spec.new(nil, 'JSONKit') { |s| s.version = '1.5pre' }],
+          }
+      end
+
       #--------------------------------------#
 
       it 'fetches the dependencies with external sources' do
         podfile_state = Installer::Analyzer::SpecsState.new
         podfile_state.added << 'BananaLib'
-        @analyzer.stubs(:result).returns(stub(:podfile_state => podfile_state))
-        @podfile.stubs(:dependencies).returns([Dependency.new('BananaLib', :git => 'example.com')])
+        @podfile = Podfile.new do
+          pod 'BananaLib', :git => 'example.com'
+        end
+        @analyzer = Installer::Analyzer.new(@sandbox, @podfile)
         ExternalSources::DownloaderSource.any_instance.expects(:fetch)
-        @analyzer.send(:fetch_external_sources)
+        @analyzer.send(:fetch_external_sources, podfile_state)
       end
 
       it 'does not download the same source multiple times for different subspecs' do
         podfile_state = Installer::Analyzer::SpecsState.new
         podfile_state.added << 'ARAnalytics'
-        @analyzer.stubs(:result).returns(stub(:podfile_state => podfile_state))
-        @podfile.stubs(:dependencies).returns([
-          Dependency.new('ARAnalytics/Mixpanel', :git => 'https://github.com/orta/ARAnalytics', :commit => '6f1a1c314894437e7e5c09572c276e644dbfb64b'),
-          Dependency.new('ARAnalytics/HockeyApp', :git => 'https://github.com/orta/ARAnalytics', :commit => '6f1a1c314894437e7e5c09572c276e644dbfb64b'),
-        ])
+        @podfile = Podfile.new do
+          pod 'ARAnalytics/Mixpanel', :git => 'https://github.com/orta/ARAnalytics', :commit => '6f1a1c314894437e7e5c09572c276e644dbfb64b'
+          pod 'ARAnalytics/HockeyApp', :git => 'https://github.com/orta/ARAnalytics', :commit => '6f1a1c314894437e7e5c09572c276e644dbfb64b'
+        end
+        @analyzer = Installer::Analyzer.new(@sandbox, @podfile)
         ExternalSources::DownloaderSource.any_instance.expects(:fetch).once
-        @analyzer.send(:fetch_external_sources)
-      end
-
-      xit 'it fetches the specification from either the sandbox or from the remote by default' do
-        dependency = Dependency.new('Name', :git => 'www.example.com')
-        ExternalSources::DownloaderSource.any_instance.expects(:specification_from_external).returns(Specification.new).once
-        @resolver.send(:set_from_external_source, dependency)
-      end
-
-      xit 'it fetches the specification from the remote if in update mode' do
-        dependency = Dependency.new('Name', :git => 'www.example.com')
-        ExternalSources::DownloaderSource.any_instance.expects(:specification).returns(Specification.new).once
-        @resolver.update_external_specs = false
-        @resolver.send(:set_from_external_source, dependency)
-      end
-
-      xit 'it fetches the specification only from the sandbox if pre-downloads are disabled' do
-        dependency = Dependency.new('Name', :git => 'www.example.com')
-        Sandbox.any_instance.expects(:specification).returns(Specification.new).once
-        @resolver.allow_pre_downloads = true
-        @resolver.send(:set_from_external_source, dependency)
+        @analyzer.send(:fetch_external_sources, podfile_state)
       end
 
       #--------------------------------------#
@@ -640,7 +1654,6 @@ module Pod
 
       it 'warns when a dependency is duplicated' do
         podfile = Podfile.new do
-          source 'https://github.com/CocoaPods/Specs.git'
           project 'SampleProject/SampleProject'
           platform :ios, '8.0'
           target 'SampleProject' do
@@ -672,17 +1685,81 @@ module Pod
 
       #-------------------------------------------------------------------------#
 
-      it 'handles test only pod targets' do
-        pod_target_one = stub(:name => 'Pod1', :dependent_targets => [], :test_dependent_targets => [])
-        pod_target_two = stub(:name => 'Pod2', :dependent_targets => [], :test_dependent_targets => [])
-        pod_target_three = stub(:name => 'Pod3', :dependent_targets => [pod_target_one, pod_target_two], :test_dependent_targets => [])
-        pod_target_four = stub(:name => 'Pod4', :dependent_targets => [], :test_dependent_targets => [pod_target_three])
+      describe '#group_pod_targets_by_target_definition' do
+        it 'does include pod target if any spec is not used by tests only and is part of target definition' do
+          spec1 = Resolver::ResolverSpecification.new(stub(:root => stub(:name => 'Pod1')), false, nil)
+          spec2 = Resolver::ResolverSpecification.new(stub(:root => stub(:name => 'Pod1')), true, nil)
+          target_definition = @podfile.target_definitions['SampleProject']
+          pod_target = stub(:name => 'Pod1', :target_definitions => [target_definition], :specs => [spec1.spec, spec2.spec], :pod_name => 'Pod1')
+          resolver_specs_by_target = { target_definition => [spec1, spec2] }
+          @analyzer.send(:group_pod_targets_by_target_definition, [pod_target], resolver_specs_by_target).should == { target_definition => [pod_target] }
+        end
 
-        all_pod_targets = [pod_target_one, pod_target_two, pod_target_three, pod_target_four]
-        @analyzer.send(:pod_target_test_only?, pod_target_one, all_pod_targets).should.be.false
-        @analyzer.send(:pod_target_test_only?, pod_target_two, all_pod_targets).should.be.false
-        @analyzer.send(:pod_target_test_only?, pod_target_three, all_pod_targets).should.be.true
-        @analyzer.send(:pod_target_test_only?, pod_target_four, all_pod_targets).should.be.false
+        it 'does not include pod target if its used by tests only' do
+          spec1 = Resolver::ResolverSpecification.new(stub(:root => stub(:name => 'Pod1')), true, nil)
+          spec2 = Resolver::ResolverSpecification.new(stub(:root => stub(:name => 'Pod1')), true, nil)
+          target_definition = stub('TargetDefinition')
+          pod_target = stub(:name => 'Pod1', :target_definitions => [target_definition], :specs => [spec1.spec, spec2.spec], :pod_name => 'Pod1')
+          resolver_specs_by_target = { target_definition => [spec1, spec2] }
+          @analyzer.send(:group_pod_targets_by_target_definition, [pod_target], resolver_specs_by_target).should == { target_definition => [] }
+        end
+
+        it 'does not include pod target if its not part of the target definition' do
+          spec = Resolver::ResolverSpecification.new(stub(:root => stub(:name => 'Pod1')), false, nil)
+          target_definition = stub
+          pod_target = stub(:name => 'Pod1', :target_definitions => [], :specs => [spec.spec])
+          resolver_specs_by_target = { target_definition => [spec] }
+          @analyzer.send(:group_pod_targets_by_target_definition, [pod_target], resolver_specs_by_target).should == { target_definition => [] }
+        end
+      end
+
+      describe '#filter_pod_targets_for_target_definition' do
+        it 'returns whether it is whitelisted in a build configuration' do
+          target_definition = @podfile.target_definitions['SampleProject']
+          target_definition.whitelist_pod_for_configuration('JSONKit', 'Debug')
+
+          aggregate_target = @analyzer.analyze.targets.find { |t| t.target_definition == target_definition }
+          aggregate_target.pod_targets_for_build_configuration('Debug').map(&:name).
+            should.include 'JSONKit'
+          aggregate_target.pod_targets_for_build_configuration('Release').map(&:name).
+            should.not.include 'JSONKit'
+        end
+
+        it 'allows a pod that is a dependency for other pods to be whitelisted' do
+          @podfile = Podfile.new do
+            platform :ios, '8.0'
+            project 'SampleProject/SampleProject'
+            target 'SampleProject' do
+              pod 'AFNetworking', :configuration => 'Debug'
+              pod 'AFNetworkActivityLogger'
+            end
+          end
+          @analyzer = Installer::Analyzer.new(config.sandbox, @podfile)
+          target_definition = @podfile.target_definitions['SampleProject']
+          aggregate_target = @analyzer.analyze.targets.find { |t| t.target_definition == target_definition }
+
+          aggregate_target.pod_targets_for_build_configuration('Debug').map(&:name).
+            should.include 'AFNetworking'
+          aggregate_target.pod_targets_for_build_configuration('Release').map(&:name).
+            should.not.include 'AFNetworking'
+        end
+
+        it 'raises if a Pod is whitelisted for different build configurations' do
+          @podfile = Podfile.new do
+            platform :ios, '8.0'
+            project 'SampleProject/SampleProject'
+            target 'SampleProject' do
+              pod 'AFNetworking'
+              pod 'AFNetworking/NSURLConnection', :configuration => 'Debug'
+              pod 'AFNetworkActivityLogger'
+            end
+          end
+          @analyzer = Installer::Analyzer.new(config.sandbox, @podfile)
+
+          should.raise(Informative) do
+            @analyzer.analyze
+          end.message.should.include 'The subspecs of `AFNetworking` are linked to different build configurations for the `Pods-SampleProject` target. CocoaPods does not currently support subspecs across different build configurations.'
+        end
       end
 
       #-------------------------------------------------------------------------#
@@ -694,15 +1771,18 @@ module Pod
             source SpecHelper.test_repo_url
             platform :ios, '6.0'
             project 'Sample Extensions Project/Sample Extensions Project'
+            pod 'matryoshka/Bar'
 
             target 'Sample Extensions Project' do
               pod 'JSONKit', '1.4'
+              pod 'matryoshka/Foo'
             end
 
             target 'Today Extension' do
               pod 'monkey'
             end
           end
+          Pod::Installer::Analyzer.any_instance.stubs(:sources_manager).returns(@sources_manager)
         end
 
         it 'copies extension pod targets to host target, when use_frameworks!' do
@@ -712,8 +1792,24 @@ module Pod
 
           result.targets.flat_map { |at| at.pod_targets.map { |pt| "#{at.name}/#{pt.name}" } }.sort.should == [
             'Pods-Sample Extensions Project/JSONKit',
+            'Pods-Sample Extensions Project/matryoshka-Bar-Foo',
             'Pods-Sample Extensions Project/monkey',
+            'Pods-Today Extension/matryoshka-Bar',
             'Pods-Today Extension/monkey',
+          ].sort
+          result.targets.flat_map { |at| at.pod_targets_for_build_configuration('Debug').map { |pt| "#{at.name}/Debug/#{pt.name}" } }.sort.should == [
+            'Pods-Sample Extensions Project/Debug/JSONKit',
+            'Pods-Sample Extensions Project/Debug/matryoshka-Bar-Foo',
+            'Pods-Sample Extensions Project/Debug/monkey',
+            'Pods-Today Extension/Debug/matryoshka-Bar',
+            'Pods-Today Extension/Debug/monkey',
+          ].sort
+          result.targets.flat_map { |at| at.pod_targets_for_build_configuration('Release').map { |pt| "#{at.name}/Release/#{pt.name}" } }.sort.should == [
+            'Pods-Sample Extensions Project/Release/JSONKit',
+            'Pods-Sample Extensions Project/Release/matryoshka-Bar-Foo',
+            'Pods-Sample Extensions Project/Release/monkey',
+            'Pods-Today Extension/Release/matryoshka-Bar',
+            'Pods-Today Extension/Release/monkey',
           ].sort
         end
 
@@ -723,11 +1819,44 @@ module Pod
 
           result.targets.flat_map { |at| at.pod_targets.map { |pt| "#{at.name}/#{pt.name}" } }.sort.should == [
             'Pods-Sample Extensions Project/JSONKit',
+            'Pods-Sample Extensions Project/matryoshka-Bar-Foo',
+            'Pods-Today Extension/matryoshka-Bar',
             'Pods-Today Extension/monkey',
           ].sort
         end
 
-        it "copy a framework's pod target, when the framework is in a sub project" do
+        it 'does not copy extension pod targets to host target, when use_frameworks! but contained pod is static' do
+          SpecHelper.create_sample_app_copy_from_fixture('Sample Extensions Project')
+          fixture_path = ROOT + 'spec/fixtures'
+          podfile = Pod::Podfile.new do
+            source SpecHelper.test_repo_url
+            platform :ios, '6.0'
+            project 'Sample Extensions Project/Sample Extensions Project'
+            use_frameworks!
+
+            target 'Sample Extensions Project' do
+              pod 'JSONKit', '1.4'
+            end
+
+            target 'Today Extension' do
+              pod 'matryoshka', :path => (fixture_path + 'static-matryoshka').to_s
+            end
+          end
+
+          analyzer = Pod::Installer::Analyzer.new(config.sandbox, podfile)
+          # Create 'Local Podspecs' folder within target project
+          Dir.mkdir(File.join(config.sandbox.root, 'Local Podspecs'))
+          result = analyzer.analyze
+
+          result.targets.flat_map { |at| at.pod_targets.map { |pt| "#{at.name}/#{pt.name}" } }.sort.should == [
+            'Pods-Sample Extensions Project/JSONKit',
+            'Pods-Sample Extensions Project/monkey',
+            'Pods-Today Extension/monkey',
+            'Pods-Today Extension/matryoshka',
+          ].sort
+        end
+
+        it 'copies pod targets of frameworks and libraries from within sub projects' do
           podfile = Pod::Podfile.new do
             source SpecHelper.test_repo_url
             use_frameworks!
@@ -742,6 +1871,51 @@ module Pod
               project 'SampleProject/Sample Lib/Sample Lib'
               pod 'monkey'
             end
+
+            target 'SampleLib' do
+              project 'SampleProject/Sample Lib/Sample Lib'
+              pod 'matryoshka'
+            end
+          end
+          analyzer = Pod::Installer::Analyzer.new(config.sandbox, podfile)
+          result = analyzer.analyze
+
+          result.targets.select { |at| at.name == 'Pods-SampleProject' }.flat_map(&:pod_targets).map(&:name).sort.uniq.should == %w(
+            JSONKit
+            matryoshka
+            monkey
+          ).sort
+          result.targets.flat_map { |at| at.pod_targets_for_build_configuration('Debug').map { |pt| "#{at.name}/Debug/#{pt.name}" } }.sort.should == [
+            'Pods-SampleFramework/Debug/monkey',
+            'Pods-SampleLib/Debug/matryoshka',
+            'Pods-SampleProject/Debug/JSONKit',
+            'Pods-SampleProject/Debug/matryoshka',
+            'Pods-SampleProject/Debug/monkey',
+          ].sort
+          result.targets.flat_map { |at| at.pod_targets_for_build_configuration('Release').map { |pt| "#{at.name}/Release/#{pt.name}" } }.sort.should == [
+            'Pods-SampleFramework/Release/monkey',
+            'Pods-SampleLib/Release/matryoshka',
+            'Pods-SampleProject/Release/JSONKit',
+            'Pods-SampleProject/Release/matryoshka',
+            'Pods-SampleProject/Release/monkey',
+          ].sort
+        end
+
+        it "copy a framework's pod target, when the framework is in a sub project and is scoped to a configuration" do
+          podfile = Pod::Podfile.new do
+            source SpecHelper.test_repo_url
+            use_frameworks!
+            platform :ios, '8.0'
+            project 'SampleProject/SampleProject'
+
+            target 'SampleProject' do
+              pod 'JSONKit'
+            end
+
+            target 'SampleFramework' do
+              project 'SampleProject/Sample Lib/Sample Lib'
+              pod 'monkey', :configurations => ['Debug']
+            end
           end
           analyzer = Pod::Installer::Analyzer.new(config.sandbox, podfile)
           result = analyzer.analyze
@@ -750,6 +1924,14 @@ module Pod
             JSONKit
             monkey
           ).sort
+          result.targets.flat_map { |at| at.pod_targets_for_build_configuration('Debug').map { |pt| "#{at.name}/Debug/#{pt.name}" } }.sort.should == [
+            'Pods-SampleFramework/Debug/monkey',
+            'Pods-SampleProject/Debug/JSONKit',
+            'Pods-SampleProject/Debug/monkey',
+          ].sort
+          result.targets.flat_map { |at| at.pod_targets_for_build_configuration('Release').map { |pt| "#{at.name}/Release/#{pt.name}" } }.sort.should == [
+            'Pods-SampleProject/Release/JSONKit',
+          ].sort
         end
 
         it "copy a static library's pod target, when the static library is in a sub project" do
@@ -757,9 +1939,11 @@ module Pod
             source SpecHelper.test_repo_url
             platform :ios, '8.0'
             project 'SampleProject/SampleProject'
+            pod 'matryoshka/Bar'
 
             target 'SampleProject' do
               pod 'JSONKit'
+              pod 'matryoshka/Foo'
             end
 
             target 'SampleLib' do
@@ -772,8 +1956,82 @@ module Pod
 
           result.targets.select { |at| at.name == 'Pods-SampleProject' }.flat_map(&:pod_targets).map(&:name).sort.uniq.should == %w(
             JSONKit
+            matryoshka-Bar-Foo
             monkey
           ).sort
+          result.targets.flat_map { |at| at.pod_targets_for_build_configuration('Debug').map { |pt| "#{at.name}/Debug/#{pt.name}" } }.sort.should == [
+            'Pods-SampleLib/Debug/matryoshka-Bar',
+            'Pods-SampleLib/Debug/monkey',
+            'Pods-SampleProject/Debug/JSONKit',
+            'Pods-SampleProject/Debug/matryoshka-Bar-Foo',
+            'Pods-SampleProject/Debug/monkey',
+          ].sort
+          result.targets.flat_map { |at| at.pod_targets_for_build_configuration('Release').map { |pt| "#{at.name}/Release/#{pt.name}" } }.sort.should == [
+            'Pods-SampleLib/Release/matryoshka-Bar',
+            'Pods-SampleLib/Release/monkey',
+            'Pods-SampleProject/Release/JSONKit',
+            'Pods-SampleProject/Release/matryoshka-Bar-Foo',
+            'Pods-SampleProject/Release/monkey',
+          ].sort
+        end
+
+        it "copy a static library's pod target, when the static library is in a sub project and is scoped to a configuration" do
+          podfile = Pod::Podfile.new do
+            source SpecHelper.test_repo_url
+            platform :ios, '8.0'
+            project 'SampleProject/SampleProject'
+
+            target 'SampleProject' do
+              pod 'JSONKit'
+            end
+
+            target 'SampleLib' do
+              project 'SampleProject/Sample Lib/Sample Lib'
+              pod 'monkey', :configuration => ['Debug']
+            end
+          end
+          analyzer = Pod::Installer::Analyzer.new(config.sandbox, podfile)
+          result = analyzer.analyze
+
+          result.targets.select { |at| at.name == 'Pods-SampleProject' }.flat_map(&:pod_targets).map(&:name).sort.uniq.should == %w(
+            JSONKit
+            monkey
+          ).sort
+          result.targets.flat_map { |at| at.pod_targets_for_build_configuration('Debug').map { |pt| "#{at.name}/Debug/#{pt.name}" } }.sort.should == [
+            'Pods-SampleLib/Debug/monkey',
+            'Pods-SampleProject/Debug/JSONKit',
+            'Pods-SampleProject/Debug/monkey',
+          ].sort
+          result.targets.flat_map { |at| at.pod_targets_for_build_configuration('Release').map { |pt| "#{at.name}/Release/#{pt.name}" } }.sort.should == [
+            'Pods-SampleProject/Release/JSONKit',
+          ].sort
+        end
+
+        it "does not copy a static library's pod target, when the static library aggregate target has search paths inherited" do
+          podfile = Pod::Podfile.new do
+            source SpecHelper.test_repo_url
+            platform :ios, '8.0'
+
+            target 'SampleLib' do
+              project 'SampleProject/Sample Lib/Sample Lib'
+              pod 'monkey'
+
+              target 'SampleProject' do
+                inherit! :search_paths
+                project 'SampleProject/SampleProject'
+                pod 'JSONKit'
+              end
+            end
+          end
+          analyzer = Pod::Installer::Analyzer.new(config.sandbox, podfile)
+          result = analyzer.analyze
+
+          result.targets.flat_map do |aggregate_target|
+            aggregate_target.pod_targets.flat_map { |pt| "#{aggregate_target}/#{pt}" }
+          end.sort.should == [
+            'Pods-SampleLib/monkey',
+            'Pods-SampleProject/JSONKit',
+          ]
         end
 
         it "raises when unable to find an extension's host target" do
@@ -805,22 +2063,38 @@ module Pod
           end
           analyzer = Pod::Installer::Analyzer.new(config.sandbox, podfile)
           analyzer.analyze
-          UI.warnings.should.match /The Podfile contains framework or static library targets, for which the Podfile does not contain host targets \(targets which embed the framework\)\./
+          UI.warnings.should.match /The Podfile contains framework or static library targets \(SampleLib\), for which the Podfile does not contain host targets \(targets which embed the framework\)\./
         end
 
-        it 'warns when using a Podfile for framework-only projects' do
+        it 'warns when using dynamic frameworks with CLI targets' do
+          project_path = fixture('Sample Extensions Project/Sample Extensions Project')
           podfile = Pod::Podfile.new do
             source SpecHelper.test_repo_url
-            use_frameworks!
             platform :ios, '8.0'
-            target 'SampleFramework' do
-              project 'SampleProject/Sample Lib/Sample Lib'
+            project project_path
+            target 'SampleCommandLineTool' do
+              use_frameworks!
               pod 'monkey'
             end
           end
           analyzer = Pod::Installer::Analyzer.new(config.sandbox, podfile)
           analyzer.analyze
-          UI.warnings.should.match /The Podfile contains framework or static library targets, for which the Podfile does not contain host targets \(targets which embed the framework\)\./
+          UI.warnings.should.match /The Podfile contains command line tool target\(s\) \(SampleCommandLineTool\) which are attempting to integrate dynamic frameworks or libraries\./
+        end
+
+        it 'does not warn when using static libraries with CLI targets' do
+          project_path = fixture('Sample Extensions Project/Sample Extensions Project')
+          podfile = Pod::Podfile.new do
+            source SpecHelper.test_repo_url
+            platform :ios, '8.0'
+            project project_path
+            target 'SampleCommandLineTool' do
+              pod 'monkey'
+            end
+          end
+          analyzer = Pod::Installer::Analyzer.new(config.sandbox, podfile)
+          analyzer.analyze
+          UI.warnings.should.be.empty?
         end
 
         it 'raises when the extension calls use_frameworks!, but the host target does not' do
@@ -843,6 +2117,261 @@ module Pod
             analyzer.analyze
           end.message.should.match /Sample Extensions Project \(false\) and Today Extension \(true\) do not both set use_frameworks!\./
         end
+
+        describe 'APPLICATION_EXTENSION_API_ONLY' do
+          it 'configures APPLICATION_EXTENSION_API_ONLY for app extension targets' do
+            @podfile.use_frameworks!
+            analyzer = Pod::Installer::Analyzer.new(config.sandbox, @podfile)
+            result = analyzer.analyze
+
+            result.targets.map { |t| [t.name, t.application_extension_api_only] }.
+              should == [['Pods-Sample Extensions Project', false], ['Pods-Today Extension', true]]
+            result.pod_targets.map { |t| [t.name, t.application_extension_api_only] }.
+              should == [['matryoshka-Bar', true], ['matryoshka-Bar-Foo', false], ['JSONKit', false], ['monkey', true]]
+          end
+
+          it 'configures APPLICATION_EXTENSION_API_ONLY for watch app extension targets' do
+            @user_project = Xcodeproj::Project.open(SpecHelper.create_sample_app_copy_from_fixture('Sample Extensions Project'))
+            targets = @user_project.targets
+            targets.delete(targets.find('Sample Extensions Project').first)
+            extension_target = targets.find('Today Extension').first
+            extension_target.product_type = 'com.apple.product-type.watchkit2-extension'
+            extension_target.name = 'watchOS Extension Target'
+            extension_target.symbol_type.should == :watch2_extension
+            @user_project.save
+            project_path = @user_project.path
+            @podfile = Pod::Podfile.new do
+              source SpecHelper.test_repo_url
+              platform :watchos, '2.0'
+              project project_path
+
+              target 'watchOS Extension Target' do
+                use_frameworks!
+                pod 'monkey'
+              end
+            end
+
+            @podfile.use_frameworks!
+            analyzer = Pod::Installer::Analyzer.new(config.sandbox, @podfile)
+            result = analyzer.analyze
+
+            result.targets.map { |t| [t.name, t.application_extension_api_only] }.
+              should == [['Pods-watchOS Extension Target', true]]
+            result.pod_targets.map { |t| [t.name, t.application_extension_api_only] }.
+              should == [['monkey', true]]
+          end
+
+          it 'configures APPLICATION_EXTENSION_API_ONLY for TV app extension targets' do
+            @user_project = Xcodeproj::Project.open(SpecHelper.create_sample_app_copy_from_fixture('Sample Extensions Project'))
+            targets = @user_project.targets
+            targets.delete(targets.find('Sample Extensions Project').first)
+            extension_target = targets.find('Today Extension').first
+            extension_target.product_type = 'com.apple.product-type.tv-app-extension'
+            extension_target.name = 'tvOS Extension Target'
+            extension_target.symbol_type.should == :tv_extension
+            @user_project.save
+            project_path = @user_project.path
+            @podfile = Pod::Podfile.new do
+              source SpecHelper.test_repo_url
+              platform :tvos, '9.0'
+              project project_path
+
+              target 'tvOS Extension Target' do
+                use_frameworks!
+                pod 'monkey'
+              end
+            end
+
+            @podfile.use_frameworks!
+            analyzer = Pod::Installer::Analyzer.new(config.sandbox, @podfile)
+            result = analyzer.analyze
+
+            result.targets.map { |t| [t.name, t.application_extension_api_only] }.
+              should == [['Pods-tvOS Extension Target', true]]
+            result.pod_targets.map { |t| [t.name, t.application_extension_api_only] }.
+              should == [['monkey', true]]
+          end
+
+          it 'configures APPLICATION_EXTENSION_API_ONLY for messages extension targets' do
+            @user_project = Xcodeproj::Project.open(SpecHelper.create_sample_app_copy_from_fixture('Sample Extensions Project'))
+            targets = @user_project.targets
+            app_target = targets.find { |t| t.name == 'Sample Extensions Project' }
+            app_target.product_type = 'com.apple.product-type.application.messages'
+            extension_target = targets.find { |t| t.name == 'Today Extension' }
+            extension_target.product_type = 'com.apple.product-type.app-extension.messages'
+            extension_target.name = 'Messages Extension Target'
+            extension_target.symbol_type.should == :messages_extension
+            @user_project.save
+            project_path = @user_project.path
+            @podfile = Pod::Podfile.new do
+              source SpecHelper.test_repo_url
+              platform :ios, '8.0'
+              project project_path
+
+              target 'Sample Extensions Project' do
+                pod 'JSONKit', '1.4'
+              end
+
+              target 'Messages Extension Target' do
+                use_frameworks!
+                pod 'monkey'
+              end
+            end
+
+            @podfile.use_frameworks!
+            analyzer = Pod::Installer::Analyzer.new(config.sandbox, @podfile)
+            result = analyzer.analyze
+
+            result.targets.map { |t| [t.name, t.application_extension_api_only] }.
+              should == [['Pods-Sample Extensions Project', false], ['Pods-Messages Extension Target', true]]
+            result.pod_targets.map { |t| [t.name, t.application_extension_api_only] }.
+              should == [['JSONKit', false], ['monkey', true]]
+          end
+
+          it 'configures APPLICATION_EXTENSION_API_ONLY when build setting is set in user target' do
+            @user_project = Xcodeproj::Project.open(SpecHelper.create_sample_app_copy_from_fixture('Sample Extensions Project'))
+            targets = @user_project.targets
+            app_target = targets.find { |t| t.name == 'Sample Extensions Project' }
+            app_target.build_configurations.each { |c| c.build_settings['APPLICATION_EXTENSION_API_ONLY'] = 'YES' }
+            @user_project.save
+            project_path = @user_project.path
+            @podfile = Pod::Podfile.new do
+              source SpecHelper.test_repo_url
+              platform :ios, '8.0'
+              project project_path
+
+              target 'Sample Extensions Project' do
+                pod 'JSONKit', '1.4'
+              end
+
+              target 'Today Extension' do
+                use_frameworks!
+                pod 'monkey'
+              end
+            end
+
+            @podfile.use_frameworks!
+            analyzer = Pod::Installer::Analyzer.new(config.sandbox, @podfile)
+            result = analyzer.analyze
+
+            result.targets.map { |t| [t.name, t.application_extension_api_only] }.
+              should == [['Pods-Sample Extensions Project', true], ['Pods-Today Extension', true]]
+            result.pod_targets.map { |t| [t.name, t.application_extension_api_only] }.
+              should == [['JSONKit', true], ['monkey', true]]
+          end
+        end
+
+        it 'configures APPLICATION_EXTENSION_API_ONLY when build setting is set in user target xcconfig' do
+          @user_project = Xcodeproj::Project.open(SpecHelper.create_sample_app_copy_from_fixture('Sample Extensions Project'))
+          targets = @user_project.targets
+          app_target = targets.find { |t| t.name == 'Sample Extensions Project' }
+          sample_config = @user_project.new_file('App.xcconfig')
+          File.write(sample_config.real_path, 'APPLICATION_EXTENSION_API_ONLY=YES')
+          app_target.build_configurations.each do |config|
+            config.base_configuration_reference = sample_config
+          end
+          @user_project.save
+          project_path = @user_project.path
+          @podfile = Pod::Podfile.new do
+            source SpecHelper.test_repo_url
+            platform :ios, '8.0'
+            project project_path
+
+            target 'Sample Extensions Project' do
+              pod 'JSONKit', '1.4'
+            end
+
+            target 'Today Extension' do
+              use_frameworks!
+              pod 'monkey'
+            end
+          end
+
+          @podfile.use_frameworks!
+          analyzer = Pod::Installer::Analyzer.new(config.sandbox, @podfile)
+          result = analyzer.analyze
+
+          result.targets.map { |t| [t.name, t.application_extension_api_only] }.
+            should == [['Pods-Sample Extensions Project', true], ['Pods-Today Extension', true]]
+          result.pod_targets.map { |t| [t.name, t.application_extension_api_only] }.
+            should == [['JSONKit', true], ['monkey', true]]
+        end
+
+        describe 'BUILD_LIBRARY_FOR_DISTRIBUTION' do
+          it 'configures BUILD_LIBRARY_FOR_DISTRIBUTION when build setting is set in user target' do
+            @user_project = Xcodeproj::Project.open(SpecHelper.create_sample_app_copy_from_fixture('Sample Extensions Project'))
+            targets = @user_project.targets
+            app_target = targets.find { |t| t.name == 'Sample Extensions Project' }
+            app_target.build_configurations.each { |c| c.build_settings['BUILD_LIBRARY_FOR_DISTRIBUTION'] = 'YES' }
+            app_target = targets.find { |t| t.name == 'Today Extension' }
+            app_target.build_configurations.each { |c| c.build_settings['BUILD_LIBRARY_FOR_DISTRIBUTION'] = 'YES' }
+            @user_project.save
+            project_path = @user_project.path
+            @podfile = Pod::Podfile.new do
+              source SpecHelper.test_repo_url
+              platform :ios, '8.0'
+              project project_path
+
+              target 'Sample Extensions Project' do
+                pod 'JSONKit', '1.4'
+              end
+
+              target 'Today Extension' do
+                use_frameworks!
+                pod 'monkey'
+              end
+            end
+
+            @podfile.use_frameworks!
+            analyzer = Pod::Installer::Analyzer.new(config.sandbox, @podfile)
+            result = analyzer.analyze
+
+            result.targets.map { |t| [t.name, t.build_library_for_distribution] }.
+              should == [['Pods-Sample Extensions Project', true], ['Pods-Today Extension', true]]
+            result.pod_targets.map { |t| [t.name, t.build_library_for_distribution] }.
+              should == [['JSONKit', true], ['monkey', true]]
+          end
+
+          it 'configures BUILD_LIBRARY_FOR_DISTRIBUTION when build setting is set in user target xcconfig' do
+            @user_project = Xcodeproj::Project.open(SpecHelper.create_sample_app_copy_from_fixture('Sample Extensions Project'))
+            sample_config = @user_project.new_file('App.xcconfig')
+            File.write(sample_config.real_path, 'BUILD_LIBRARY_FOR_DISTRIBUTION=YES')
+            targets = @user_project.targets
+            app_target = targets.find { |t| t.name == 'Sample Extensions Project' }
+            app_target.build_configurations.each do |config|
+              config.base_configuration_reference = sample_config
+            end
+            app_target = targets.find { |t| t.name == 'Today Extension' }
+            app_target.build_configurations.each do |config|
+              config.base_configuration_reference = sample_config
+            end
+            @user_project.save
+            project_path = @user_project.path
+            @podfile = Pod::Podfile.new do
+              source SpecHelper.test_repo_url
+              platform :ios, '8.0'
+              project project_path
+
+              target 'Sample Extensions Project' do
+                pod 'JSONKit', '1.4'
+              end
+
+              target 'Today Extension' do
+                use_frameworks!
+                pod 'monkey'
+              end
+            end
+
+            @podfile.use_frameworks!
+            analyzer = Pod::Installer::Analyzer.new(config.sandbox, @podfile)
+            result = analyzer.analyze
+
+            result.targets.map { |t| [t.name, t.build_library_for_distribution] }.
+              should == [['Pods-Sample Extensions Project', true], ['Pods-Today Extension', true]]
+            result.pod_targets.map { |t| [t.name, t.build_library_for_distribution] }.
+              should == [['JSONKit', true], ['monkey', true]]
+          end
+        end
       end
 
       #-------------------------------------------------------------------------#
@@ -851,8 +2380,7 @@ module Pod
         describe '#sources' do
           describe 'when there are no explicit sources' do
             it 'defaults to the master spec repository' do
-              @analyzer.send(:sources).map(&:url).should ==
-                ['https://github.com/CocoaPods/Specs.git']
+              @analyzer.send(:sources).map(&:url).should == [Pod::TrunkSource::TRUNK_REPO_URL]
             end
           end
 
@@ -874,7 +2402,7 @@ module Pod
                 pod 'JSONKit', '1.4'
               end
               @analyzer.instance_variable_set(:@podfile, podfile)
-              config.sources_manager.expects(:find_or_create_source_with_url).once
+              @analyzer.sources_manager.expects(:find_or_create_source_with_url).once
               @analyzer.send(:sources)
             end
           end
@@ -890,7 +2418,7 @@ module Pod
       it 'raises when dependencies with the same name have different ' \
         'external sources' do
         podfile = Podfile.new do
-          source 'https://github.com/CocoaPods/Specs.git'
+          source Pod::TrunkSource::TRUNK_REPO_URL
           project 'SampleProject/SampleProject'
           platform :ios
           target 'SampleProject' do
@@ -909,7 +2437,7 @@ module Pod
       it 'raises when dependencies with the same root name have different ' \
         'external sources' do
         podfile = Podfile.new do
-          source 'https://github.com/CocoaPods/Specs.git'
+          source Pod::TrunkSource::TRUNK_REPO_URL
           project 'SampleProject/SampleProject'
           platform :ios
           target 'SampleProject' do
@@ -928,7 +2456,7 @@ module Pod
       it 'raises when dependencies with the same name have different ' \
         'external sources with one being nil' do
         podfile = Podfile.new do
-          source 'https://github.com/CocoaPods/Specs.git'
+          source Pod::TrunkSource::TRUNK_REPO_URL
           project 'SampleProject/SampleProject'
           platform :ios
           target 'SampleProject' do
@@ -948,7 +2476,7 @@ module Pod
     describe 'podfile validation' do
       before do
         @sandbox = stub('Sandbox')
-        @podfile = stub('Podfile')
+        @podfile = Podfile.new
         @analyzer = Installer::Analyzer.new(@sandbox, @podfile)
       end
 
@@ -968,6 +2496,60 @@ module Pod
 
         @analyzer.send(:validate_podfile!)
         UI.warnings.should == "The Podfile does not contain any dependencies.\n"
+      end
+    end
+
+    describe 'swift version' do
+      before do
+        @banana_spec = fixture_spec('banana-lib/BananaLib.podspec')
+        @podfile = Podfile.new
+        @analyzer = Pod::Installer::Analyzer.new(config.sandbox, @podfile)
+      end
+
+      it 'returns the swift version with the given requirements from the target definition' do
+        target_definition = fixture_target_definition('App')
+        target_definition.store_swift_version_requirements('>= 4.0')
+        @banana_spec.swift_versions = ['3.0', '4.0']
+        @analyzer.send(:determine_swift_version, @banana_spec, [target_definition]).should == '4.0'
+      end
+
+      it 'returns the swift version with the given requirements from all target definitions' do
+        target_definition_one = fixture_target_definition('App1')
+        target_definition_one.store_swift_version_requirements('>= 4.0')
+        target_definition_two = fixture_target_definition('App2')
+        target_definition_two.store_swift_version_requirements('= 4.2')
+        @banana_spec.swift_versions = ['3.0', '4.0', '4.2']
+        @analyzer.send(:determine_swift_version, @banana_spec, [target_definition_one, target_definition_two]).should == '4.2'
+      end
+
+      it 'returns an empty swift version if none of the requirements match' do
+        target_definition_one = fixture_target_definition('App1')
+        target_definition_one.store_swift_version_requirements('>= 4.0')
+        target_definition_two = fixture_target_definition('App2')
+        target_definition_two.store_swift_version_requirements('= 4.2')
+        @banana_spec.swift_versions = ['3.0', '4.0']
+        @analyzer.send(:determine_swift_version, @banana_spec, [target_definition_one, target_definition_two]).should == ''
+      end
+
+      it 'uses the swift version defined in the specification' do
+        @banana_spec.swift_versions = ['3.0']
+        target_definition = fixture_target_definition('App1')
+        target_definition.swift_version = '2.3'
+        @analyzer.send(:determine_swift_version, @banana_spec, [target_definition]).should == '3.0'
+      end
+
+      it 'uses the max swift version defined in the specification' do
+        @banana_spec.swift_versions = ['3.0', '4.0']
+        target_definition = fixture_target_definition('App1')
+        target_definition.swift_version = '2.3'
+        @analyzer.send(:determine_swift_version, @banana_spec, [target_definition]).should == '4.0'
+      end
+
+      it 'uses the swift version defined by the target definitions if no swift version is specified in the spec' do
+        @banana_spec.swift_versions = []
+        target_definition = fixture_target_definition('App1')
+        target_definition.swift_version = '2.3'
+        @analyzer.send(:determine_swift_version, @banana_spec, [target_definition]).should == '2.3'
       end
     end
 
@@ -998,8 +2580,9 @@ module Pod
 
       before do
         @sandbox_manifest = Pod::Lockfile.new(@lockfile.internal_data.deep_dup)
-        @analyzer.sandbox.manifest = @sandbox_manifest
+        @analyzer.sandbox.stubs(:manifest).returns(@sandbox_manifest)
         @analyzer.sandbox.stubs(:specification).with('BananaLib').returns(stub)
+        @analyzer.sandbox.stubs(:specification_path).with('BananaLib').returns(stub)
         pod_dir = stub
         pod_dir.stubs(:directory?).returns(true)
         @analyzer.sandbox.stubs(:pod_dir).with('BananaLib').returns(pod_dir)
@@ -1011,88 +2594,95 @@ module Pod
         @analyzer.send(:checkout_requires_update?, @dependency).should == true
       end
 
-      before do
-        @analyzer.result = Installer::Analyzer::AnalysisResult.new
-        @analyzer.result.podfile_state = Installer::Analyzer::SpecsState.new
-      end
-
       it 'uses lockfile checkout options when no source exists in the sandbox' do
-        @analyzer.result.podfile_state.unchanged << 'BananaLib'
         @sandbox_manifest.send(:checkout_options_data).delete('BananaLib')
 
         downloader = stub('DownloaderSource')
-        ExternalSources.stubs(:from_params).with(@lockfile_checkout_options, @dependency, @podfile.defined_in_file).returns(downloader)
+        ExternalSources.stubs(:from_params).with(@lockfile_checkout_options, @dependency, @podfile.defined_in_file,
+                                                 true).returns(downloader)
+
+        podfile_state = Installer::Analyzer::SpecsState.new
+        podfile_state.unchanged << 'BananaLib'
 
         downloader.expects(:fetch)
-        downloader.expects(:can_cache=).with(true).once
-        @analyzer.send(:fetch_external_sources)
+        @analyzer.send(:fetch_external_sources, podfile_state)
       end
 
       it 'uses lockfile checkout options when a different checkout exists in the sandbox' do
-        @analyzer.result.podfile_state.unchanged << 'BananaLib'
         @sandbox_manifest.send(:checkout_options_data)['BananaLib'] = @lockfile_checkout_options.merge(:commit => 'other commit')
 
+        podfile_state = Installer::Analyzer::SpecsState.new
+        podfile_state.unchanged << 'BananaLib'
+
         downloader = stub('DownloaderSource')
-        ExternalSources.stubs(:from_params).with(@lockfile_checkout_options, @dependency, @podfile.defined_in_file).returns(downloader)
+        ExternalSources.stubs(:from_params).with(@lockfile_checkout_options, @dependency, @podfile.defined_in_file,
+                                                 true).returns(downloader)
 
         downloader.expects(:fetch)
-        downloader.expects(:can_cache=).with(true).once
-        @analyzer.send(:fetch_external_sources)
+        @analyzer.send(:fetch_external_sources, podfile_state)
       end
 
       it 'ignores lockfile checkout options when the podfile state has changed' do
-        @analyzer.result.podfile_state.changed << 'BananaLib'
+        podfile_state = Installer::Analyzer::SpecsState.new
+        podfile_state.changed << 'BananaLib'
 
         downloader = stub('DownloaderSource')
-        ExternalSources.stubs(:from_params).with(@dependency.external_source, @dependency, @podfile.defined_in_file).returns(downloader)
+        ExternalSources.stubs(:from_params).with(@dependency.external_source, @dependency, @podfile.defined_in_file,
+                                                 true).returns(downloader)
 
         downloader.expects(:fetch)
-        downloader.expects(:can_cache=).with(true).once
-        @analyzer.send(:fetch_external_sources)
+        @analyzer.send(:fetch_external_sources, podfile_state)
       end
 
       it 'ignores lockfile checkout options when updating selected pods' do
-        @analyzer.result.podfile_state.unchanged << 'BananaLib'
-        @analyzer.stubs(:update).returns(:pods => %w(BananaLib))
+        podfile_state = Installer::Analyzer::SpecsState.new
+        podfile_state.unchanged << 'BananaLib'
+
+        @analyzer.stubs(:pods_to_update).returns(:pods => %w(BananaLib))
 
         downloader = stub('DownloaderSource')
-        ExternalSources.stubs(:from_params).with(@dependency.external_source, @dependency, @podfile.defined_in_file).returns(downloader)
+        ExternalSources.stubs(:from_params).with(@dependency.external_source, @dependency, @podfile.defined_in_file,
+                                                 true).returns(downloader)
 
         downloader.expects(:fetch)
-        downloader.expects(:can_cache=).with(true).once
-        @analyzer.send(:fetch_external_sources)
+        @analyzer.send(:fetch_external_sources, podfile_state)
       end
 
       it 'ignores lockfile checkout options when updating all pods' do
-        @analyzer.result.podfile_state.unchanged << 'BananaLib'
-        @analyzer.stubs(:update).returns(true)
+        podfile_state = Installer::Analyzer::SpecsState.new
+        podfile_state.unchanged << 'BananaLib'
+
+        @analyzer.stubs(:pods_to_update).returns(true)
 
         downloader = stub('DownloaderSource')
-        ExternalSources.stubs(:from_params).with(@dependency.external_source, @dependency, @podfile.defined_in_file).returns(downloader)
+        ExternalSources.stubs(:from_params).with(@dependency.external_source, @dependency, @podfile.defined_in_file,
+                                                 true).returns(downloader)
 
         downloader.expects(:fetch)
-        downloader.expects(:can_cache=).with(true).once
-        @analyzer.send(:fetch_external_sources)
+        @analyzer.send(:fetch_external_sources, podfile_state)
       end
 
       it 'does not use the cache when the podfile instructs not to clean' do
-        @analyzer.result.podfile_state.unchanged << 'BananaLib'
+        podfile_state = Installer::Analyzer::SpecsState.new
+        podfile_state.unchanged << 'BananaLib'
+
         @sandbox_manifest.send(:checkout_options_data).delete('BananaLib')
 
         downloader = stub('DownloaderSource')
-        ExternalSources.stubs(:from_params).with(@lockfile_checkout_options, @dependency, @podfile.defined_in_file).returns(downloader)
+        ExternalSources.stubs(:from_params).with(@lockfile_checkout_options, @dependency, @podfile.defined_in_file,
+                                                 false).returns(downloader)
 
         downloader.expects(:fetch)
-        downloader.expects(:can_cache=).with(false).once
         @analyzer.installation_options.clean = false
-        @analyzer.send(:fetch_external_sources)
+        @analyzer.send(:fetch_external_sources, podfile_state)
       end
 
       it 'does not re-fetch the external source when the sandbox has the correct revision of the source' do
-        @analyzer.result.podfile_state.unchanged << 'BananaLib'
+        podfile_state = Installer::Analyzer::SpecsState.new
+        podfile_state.unchanged << 'BananaLib'
 
         @analyzer.expects(:fetch_external_source).never
-        @analyzer.send(:fetch_external_sources)
+        @analyzer.send(:fetch_external_sources, podfile_state)
       end
     end
   end

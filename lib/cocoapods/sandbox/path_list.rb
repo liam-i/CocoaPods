@@ -1,4 +1,5 @@
 require 'active_support/multibyte/unicode'
+require 'find'
 
 module Pod
   class Sandbox
@@ -15,14 +16,14 @@ module Pod
       # @return [Pathname] The root of the list whose files and directories
       #         are used to perform the matching operations.
       #
-      attr_accessor :root
+      attr_reader :root
 
       # Initialize a new instance
       #
-      # @param  [Pathname] root The root of the PathList.
+      # @param  [Pathname] root @see #root
       #
       def initialize(root)
-        root_dir = ActiveSupport::Multibyte::Unicode.normalize(root.to_s)
+        root_dir = root.to_s.unicode_normalize(:nfkc)
         @root = Pathname.new(root_dir)
         @glob_cache = {}
       end
@@ -50,23 +51,26 @@ module Pod
         unless root.exist?
           raise Informative, "Attempt to read non existent folder `#{root}`."
         end
-        escaped_root = escape_path_for_glob(root)
-
-        absolute_paths = Pathname.glob(escaped_root + '**/*', File::FNM_DOTMATCH).lazy
-        dirs_and_files = absolute_paths.reject { |path| path.basename.to_s =~ /^\.\.?$/ }
-        dirs, files = dirs_and_files.partition { |path| File.directory?(path) }
-
+        dirs = []
+        files = []
         root_length = root.cleanpath.to_s.length + File::SEPARATOR.length
-        sorted_relative_paths_from_full_paths = lambda do |paths|
-          relative_paths = paths.lazy.map do |path|
-            path_string = path.to_s
-            path_string.slice(root_length, path_string.length - root_length)
-          end
-          relative_paths.sort_by(&:upcase)
+        escaped_root = escape_path_for_glob(root)
+        Dir.glob(escaped_root + '**/*', File::FNM_DOTMATCH).each do |f|
+          directory = File.directory?(f)
+          # Ignore `.` and `..` directories
+          next if directory && f =~ /\.\.?$/
+
+          f = f.slice(root_length, f.length - root_length)
+          next if f.nil?
+
+          (directory ? dirs : files) << f
         end
 
-        @dirs = sorted_relative_paths_from_full_paths.call(dirs)
-        @files = sorted_relative_paths_from_full_paths.call(files)
+        dirs.sort_by!(&:upcase)
+        files.sort_by!(&:upcase)
+
+        @dirs = dirs
+        @files = files
         @glob_cache = {}
       end
 
@@ -87,7 +91,8 @@ module Pod
       # @return [Array<Pathname>]
       #
       def glob(patterns, options = {})
-        relative_glob(patterns, options).map { |p| root + p }
+        cache_key = options.merge(:patterns => patterns)
+        @glob_cache[cache_key] ||= relative_glob(patterns, options).map { |p| root.join(p) }
       end
 
       # The list of relative paths that are case insensitively matched by a
@@ -114,10 +119,6 @@ module Pod
       def relative_glob(patterns, options = {})
         return [] if patterns.empty?
 
-        cache_key = options.merge(:patterns => patterns)
-        cached_value = @glob_cache[cache_key]
-        return cached_value if cached_value
-
         dir_pattern = options[:dir_pattern]
         exclude_patterns = options[:exclude_patterns]
         include_dirs = options[:include_dirs]
@@ -127,26 +128,34 @@ module Pod
         else
           full_list = files
         end
+        patterns_array = Array(patterns)
+        exact_matches = (full_list & patterns_array).to_set
 
-        list = Array(patterns).map do |pattern|
-          if directory?(pattern) && dir_pattern
-            pattern += '/' unless pattern.end_with?('/')
-            pattern += dir_pattern
-          end
-          expanded_patterns = dir_glob_equivalent_patterns(pattern)
-          full_list.select do |path|
-            expanded_patterns.any? do |p|
-              File.fnmatch(p, path, File::FNM_CASEFOLD | File::FNM_PATHNAME)
+        unless patterns_array.empty?
+          list = patterns_array.flat_map do |pattern|
+            if exact_matches.include?(pattern)
+              pattern
+            else
+              if directory?(pattern) && dir_pattern
+                pattern += '/' unless pattern.end_with?('/')
+                pattern += dir_pattern
+              end
+              expanded_patterns = dir_glob_equivalent_patterns(pattern)
+              full_list.select do |path|
+                expanded_patterns.any? do |p|
+                  File.fnmatch(p, path, File::FNM_CASEFOLD | File::FNM_PATHNAME)
+                end
+              end
             end
           end
-        end.flatten
+        end
 
         list = list.map { |path| Pathname.new(path) }
         if exclude_patterns
           exclude_options = { :dir_pattern => '**/*', :include_dirs => include_dirs }
           list -= relative_glob(exclude_patterns, exclude_options)
         end
-        @glob_cache[cache_key] = list
+        list
       end
 
       #-----------------------------------------------------------------------#
@@ -155,7 +164,7 @@ module Pod
 
       # @!group Private helpers
 
-      # @return [Bool] Wether a path is a directory. The result of this method
+      # @return [Boolean] Wether a path is a directory. The result of this method
       #         computed without accessing the file system and is case
       #         insensitive.
       #
@@ -198,11 +207,11 @@ module Pod
         else
           patterns = [pattern]
           values_by_set.each do |set, values|
-            patterns = patterns.map do |old_pattern|
+            patterns = patterns.flat_map do |old_pattern|
               values.map do |value|
                 old_pattern.gsub(set, value)
               end
-            end.flatten
+            end
           end
           patterns
         end

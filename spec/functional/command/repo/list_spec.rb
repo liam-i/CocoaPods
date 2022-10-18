@@ -35,9 +35,7 @@ module Pod
     it 'shows unknown as the branch when there is no branch for git repositories' do
       path = repo_path(name)
       path.mkpath
-      Dir.chdir(path) do
-        `git init`
-      end
+      Pod::Executable.capture_command!('git', %w(init), :chdir => path)
 
       output = run_command('repo', 'list')
       output.should.include? 'git (unknown)'
@@ -47,14 +45,13 @@ module Pod
       before do
         config.repos_dir = tmp_repos_path
 
-        Dir.chdir(repo_make('apiary')) do
-          `git remote add origin https://github.com/apiaryio/Specs`
-        end
+        Pod::Executable.capture_command!('git', %w(remote add origin https://github.com/apiaryio/Specs),
+                                         :chdir => repo_make('apiary'))
       end
 
       it 'shows the current git branch configuration' do
         output = run_command('repo', 'list')
-        output.should.include? '- Type: git (master)'
+        output.should.include? '- Type: git (main)'
       end
 
       it 'shows the git URL (when an upstream is not configured)' do

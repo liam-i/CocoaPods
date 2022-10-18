@@ -14,19 +14,26 @@ module Pod
         end
         expected = %w(
           Banana.modulemap
+          BananaFramework.framework/Versions/A/Headers/BananaFramework.h
+          BananaFramework.framework/Versions/A/Headers/SubDir/SubBananaFramework.h
           BananaLib.podspec
-          Bananalib.framework/Versions/A/Headers/Bananalib.h
-          Bananalib.framework/Versions/A/Headers/SubDir/SubBananalib.h
           Classes/Banana.h
           Classes/Banana.m
           Classes/BananaLib.pch
           Classes/BananaPrivate.h
           Classes/BananaTrace.d
+          Classes/Documentation.docc/Documentation.md
+          LICENSE
           README
           Resources/Base.lproj/Main.storyboard
           Resources/Images.xcassets/Logo.imageset/Contents.json
           Resources/Images.xcassets/Logo.imageset/logo.png
           Resources/Migration.xcmappingmodel/xcmapping.xml
+          Resources/Sample.rcproject/Library/ProjectLibrary/Contents.json
+          Resources/Sample.rcproject/Library/ProjectLibrary/Version.json
+          Resources/Sample.rcproject/SceneThumbnails/A6BD9D7A-36EE-4D49-BF83-DEB3039A790C.thumbnails/square
+          Resources/Sample.rcproject/SceneThumbnails/A6BD9D7A-36EE-4D49-BF83-DEB3039A790C.thumbnails/wide
+          Resources/Sample.rcproject/com.apple.RCFoundation.Project
           Resources/Sample.xcdatamodeld/.xccurrentversion
           Resources/Sample.xcdatamodeld/Sample\ 2.xcdatamodel/contents
           Resources/Sample.xcdatamodeld/Sample.xcdatamodel/contents
@@ -36,8 +43,10 @@ module Pod
           Resources/en.lproj/nested/logo-nested.png
           Resources/logo-sidebar.png
           Resources/sub_dir/logo-sidebar.png
+          docs/guide1.md
+          docs/subdir/guide2.md
           framework/Source/MoreBanana.h
-          libBananalib.a
+          libBananaStaticLib.a
           preserve_me.txt
           sub-dir/sub-dir-2/somefile.txt
         )
@@ -51,19 +60,26 @@ module Pod
           f.include?('libPusher') || f.include?('.git')
         end
         dirs.sort.should == %w(
-          Bananalib.framework
-          Bananalib.framework/Headers
-          Bananalib.framework/Versions
-          Bananalib.framework/Versions/A
-          Bananalib.framework/Versions/A/Headers
-          Bananalib.framework/Versions/A/Headers/SubDir
-          Bananalib.framework/Versions/Current
+          BananaFramework.framework
+          BananaFramework.framework/Headers
+          BananaFramework.framework/Versions
+          BananaFramework.framework/Versions/A
+          BananaFramework.framework/Versions/A/Headers
+          BananaFramework.framework/Versions/A/Headers/SubDir
+          BananaFramework.framework/Versions/Current
           Classes
+          Classes/Documentation.docc
+          Classes/Documentation.docc/Resources
           Resources
           Resources/Base.lproj
           Resources/Images.xcassets
           Resources/Images.xcassets/Logo.imageset
           Resources/Migration.xcmappingmodel
+          Resources/Sample.rcproject
+          Resources/Sample.rcproject/Library
+          Resources/Sample.rcproject/Library/ProjectLibrary
+          Resources/Sample.rcproject/SceneThumbnails
+          Resources/Sample.rcproject/SceneThumbnails/A6BD9D7A-36EE-4D49-BF83-DEB3039A790C.thumbnails
           Resources/Sample.xcdatamodeld
           Resources/Sample.xcdatamodeld/Sample\ 2.xcdatamodel
           Resources/Sample.xcdatamodeld/Sample.xcdatamodel
@@ -71,6 +87,8 @@ module Pod
           Resources/en.lproj
           Resources/en.lproj/nested
           Resources/sub_dir
+          docs
+          docs/subdir
           framework
           framework/Source
           sub-dir
@@ -102,6 +120,29 @@ module Pod
       it 'can return the absolute paths from glob' do
         paths = @path_list.glob('Classes/*.{h,m}')
         paths.all?(&:absolute?).should == true
+      end
+
+      describe 'Symlinked Directory' do
+        before do
+          @tmpdir = Pathname.new(Dir.mktmpdir)
+          FileUtils.copy_entry(@path_list.root.to_s, @tmpdir + 'banana-lib')
+
+          @symlink_dir = @path_list.root.dirname + 'banana-lib-symlinked'
+          FileUtils.remove_entry(@symlink_dir) if File.symlink?(@symlink_dir)
+        end
+
+        after do
+          FileUtils.remove_entry(@tmpdir) if Dir.exist?(@tmpdir)
+          FileUtils.remove_entry(@symlink_dir) if File.symlink?(@symlink_dir)
+        end
+
+        it 'glob returns the absolute path when root is a symlinked directory' do
+          File.symlink(@tmpdir + 'banana-lib', @symlink_dir.to_s)
+          @path_list = Sandbox::PathList.new(fixture('banana-lib-symlinked/'))
+
+          paths = @path_list.glob('Classes/*.{h,m}')
+          paths.first.realpath.to_s.should.include? @tmpdir.to_s
+        end
       end
 
       it 'can return the relative paths from glob' do
@@ -157,11 +198,34 @@ module Pod
           Resources/Base.lproj
           Resources/Images.xcassets
           Resources/Migration.xcmappingmodel
+          Resources/Sample.rcproject
           Resources/Sample.xcdatamodeld
           Resources/de.lproj
           Resources/en.lproj
           Resources/logo-sidebar.png
           Resources/sub_dir
+        )
+      end
+
+      it 'can glob for exact matches' do
+        paths = @path_list.relative_glob('libBananaStaticLib.a').map(&:to_s)
+        paths.sort.should == %w(
+          libBananaStaticLib.a
+        )
+      end
+
+      it 'preserves pattern order' do
+        patterns = %w(
+          Classes/BananaPrivate.h
+          Classes/Banana.h
+          Classes/Banana.m
+        )
+
+        paths = @path_list.relative_glob(patterns).map(&:to_s)
+        paths.should == %w(
+          Classes/BananaPrivate.h
+          Classes/Banana.h
+          Classes/Banana.m
         )
       end
     end
@@ -170,10 +234,12 @@ module Pod
       it 'orders paths case insensitively' do
         root = fixture('banana-unordered')
 
-        # Let Pathname.glob result be ordered case-sensitively
-        Pathname.stubs(:glob).returns([Pathname.new("#{root}/Classes/NSFetchRequest+Banana.h"),
-                                       Pathname.new("#{root}/Classes/NSFetchedResultsController+Banana.h")])
-        File.stubs(:directory?).returns(false)
+        # Let Find.find result be ordered case-sensitively
+        Find.stubs(:find).multiple_yields(
+          "#{root}/Classes",
+          "#{root}/Classes/NSFetchRequest+Banana.h",
+          "#{root}/Classes/NSFetchedResultsController+Banana.h",
+        )
 
         path_list = Sandbox::PathList.new(root)
         path_list.files.should == %w(Classes/NSFetchedResultsController+Banana.h Classes/NSFetchRequest+Banana.h)
@@ -230,15 +296,67 @@ module Pod
       end
 
       #--------------------------------------#
+    end
 
-      describe '#escape_path_for_glob' do
-        it 'escapes metacharacters' do
-          escaped = @path_list.send(:escape_path_for_glob, '[]{}?**')
-          escaped.to_s.should == '\[\]\{\}\?\*\*'
+    #-------------------------------------------------------------------------#
+
+    describe 'Symlinks' do
+      before do
+        @symlink_dir = @path_list.root + 'Classes' + 'symlinked'
+        @symlink_dir_file = @symlink_dir + 'someheader.h'
+        @symlink_file = @path_list.root + 'Classes' + 'symlinked.h'
+        @tmpdir = Pathname.new(Dir.mktmpdir)
+        tmpfile = Tempfile.new(['base', '.h'])
+        @tmpfile = tmpfile.path
+        tmpfile.close
+        @tmpdirheader = @tmpdir + 'someheader.h'
+        File.write(@tmpdirheader.to_s, '// this file does nothing. \n')
+        File.write(@tmpfile.to_s, '// this file also does nothing. \n')
+        FileUtils.remove_entry(@symlink_dir) if File.symlink?(@symlink_dir)
+        FileUtils.remove_entry(@symlink_file) if File.symlink?(@symlink_file)
+      end
+
+      after do
+        FileUtils.remove_entry(@tmpdir) if Dir.exist?(@tmpdir)
+        FileUtils.remove_entry(@tmpfile) if File.exist?(@tmpfile)
+        FileUtils.remove_entry(@symlink_dir) if File.symlink?(@symlink_dir)
+        FileUtils.remove_entry(@symlink_file) if File.symlink?(@symlink_file)
+      end
+
+      it 'includes symlinked file' do
+        @path_list.instance_variable_set(:@files, nil)
+        File.symlink(@tmpfile, @symlink_file)
+
+        @path_list.files.map(&:to_s).should.include?('Classes/symlinked.h')
+      end
+
+      it 'includes symlinked file with a different basename' do
+        orange_h = @path_list.root.join('Classes', 'Orange.h')
+        File.symlink('Banana.h', orange_h)
+
+        begin
+          @path_list.glob('Classes/Orange.h').should == [
+            orange_h,
+          ]
+        ensure
+          FileUtils.remove_entry(orange_h)
         end
       end
 
-      #--------------------------------------#
+      it 'includes symlinked dir' do
+        @path_list.instance_variable_set(:@dirs, nil)
+        File.symlink(@tmpdir, @symlink_dir)
+
+        @path_list.dirs.map(&:to_s).should.include?('Classes/symlinked')
+      end
+
+      it 'doesn\'t include file in symlinked dir' do
+        @path_list.instance_variable_set(:@files, nil)
+        @path_list.instance_variable_set(:@dirs, nil)
+        File.symlink(@tmpdir, @symlink_dir)
+
+        @path_list.files.map(&:to_s).should.not.include?('Classes/symlinked/someheader.h')
+      end
     end
 
     #-------------------------------------------------------------------------#

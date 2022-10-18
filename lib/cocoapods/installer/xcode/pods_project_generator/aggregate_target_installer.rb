@@ -6,20 +6,27 @@ module Pod
         # project and the relative support files.
         #
         class AggregateTargetInstaller < TargetInstaller
+          # @return [AggregateTarget] @see TargetInstaller#target
+          #
+          attr_reader :target
+
           # Creates the target in the Pods project and the relative support files.
           #
-          # @return [void]
+          # @return [TargetInstallationResult] the result of the installation of this target.
           #
           def install!
             UI.message "- Installing target `#{target.name}` #{target.platform}" do
-              add_target
+              native_target = add_target
               create_support_files_dir
               create_support_files_group
-              create_xcconfig_file
-              if target.requires_frameworks?
-                create_info_plist_file
-                create_module_map
-                create_umbrella_header
+              create_xcconfig_file(native_target)
+              if target.build_as_framework?
+                create_info_plist_file(target.info_plist_path, native_target, target.version, target.platform)
+                create_module_map(native_target)
+                create_umbrella_header(native_target)
+              elsif target.uses_swift?
+                create_module_map(native_target)
+                create_umbrella_header(native_target)
               end
               # Because embedded targets live in their host target, CocoaPods
               # copies all of the embedded target's pod_targets to its host
@@ -27,11 +34,13 @@ module Pod
               # cause an App Store rejection because frameworks cannot be
               # embedded in embedded targets.
               #
-              create_embed_frameworks_script unless target.requires_host_target?
-              create_bridge_support_file
-              create_copy_resources_script
+              create_embed_frameworks_script if embed_frameworks_script_required?
+              create_bridge_support_file(native_target)
+              create_copy_resources_script if target.includes_resources?
               create_acknowledgements
-              create_dummy_source
+              create_dummy_source(native_target)
+              clean_support_files_temp_dir
+              TargetInstallationResult.new(target, native_target)
             end
           end
 
@@ -60,8 +69,21 @@ module Pod
               'PODS_ROOT'                          => '$(SRCROOT)',
               'PRODUCT_BUNDLE_IDENTIFIER'          => 'org.cocoapods.${PRODUCT_NAME:rfc1034identifier}',
               'SKIP_INSTALL'                       => 'YES',
+
+              # Needed to ensure that static libraries won't try to embed the swift stdlib,
+              # since there's no where to embed in for a static library.
+              # Not necessary for dynamic frameworks either, since the aggregate targets are never shipped
+              # on their own, and are always further embedded into an app target.
+              'ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES' => 'NO',
             }
             super.merge(settings)
+          end
+
+          # @return [Boolean] whether this target requires an `Embed Frameworks` script phase
+          #
+          def embed_frameworks_script_required?
+            includes_dynamic_xcframeworks = target.xcframeworks_by_config.values.flatten.map(&:build_type).any?(&:dynamic_framework?)
+            (target.includes_frameworks? || includes_dynamic_xcframeworks) && !target.requires_host_target?
           end
 
           # Creates the group that holds the references to the support files
@@ -78,14 +100,18 @@ module Pod
 
           # Generates the contents of the xcconfig file and saves it to disk.
           #
+          # @param  [PBXNativeTarget] native_target
+          #         the native target to link the module map file into.
+          #
           # @return [void]
           #
-          def create_xcconfig_file
+          def create_xcconfig_file(native_target)
             native_target.build_configurations.each do |configuration|
+              next unless target.user_build_configurations.key?(configuration.name)
               path = target.xcconfig_path(configuration.name)
-              gen = Generator::XCConfig::AggregateXCConfig.new(target, configuration.name)
-              gen.save_as(path)
-              target.xcconfigs[configuration.name] = gen.xcconfig
+              build_settings = target.build_settings(configuration.name)
+              update_changed_file(build_settings, path)
+              target.xcconfigs[configuration.name] = build_settings.xcconfig
               xcconfig_file_ref = add_file_to_support_group(path)
               configuration.base_configuration_reference = xcconfig_file_ref
             end
@@ -97,38 +123,18 @@ module Pod
           #         target because it is needed for environments interpreted at
           #         runtime.
           #
+          # @param  [PBXNativeTarget] native_target
+          #         the native target to add the bridge support file into.
+          #
           # @return [void]
           #
-          def create_bridge_support_file
+          def create_bridge_support_file(native_target)
             if target.podfile.generate_bridge_support?
               path = target.bridge_support_path
               headers = native_target.headers_build_phase.files.map { |bf| sandbox.root + bf.file_ref.path }
               generator = Generator::BridgeSupport.new(headers)
-              generator.save_as(path)
+              update_changed_file(generator, path)
               add_file_to_support_group(path)
-              @bridge_support_file = path.relative_path_from(sandbox.root)
-            end
-          end
-
-          # Uniqued Resources grouped by config
-          #
-          # @return [Hash{ Symbol => Array<Pathname> }]
-          #
-          def resources_by_config
-            library_targets = target.pod_targets.reject do |pod_target|
-              pod_target.should_build? && pod_target.requires_frameworks?
-            end
-            target.user_build_configurations.keys.each_with_object({}) do |config, resources_by_config|
-              resources_by_config[config] = library_targets.flat_map do |library_target|
-                next [] unless library_target.include_in_build_config?(target_definition, config)
-                resource_paths = library_target.file_accessors.flat_map do |accessor|
-                  accessor.resources.flat_map { |res| res.relative_path_from(project.path.dirname) }
-                end
-                resource_bundles = library_target.file_accessors.flat_map do |accessor|
-                  accessor.resource_bundles.keys.map { |name| "#{library_target.configuration_build_dir}/#{name.shellescape}.bundle" }
-                end
-                (resource_paths + resource_bundles + [bridge_support_file].compact).uniq
-              end
             end
           end
 
@@ -142,41 +148,24 @@ module Pod
           #
           def create_copy_resources_script
             path = target.copy_resources_script_path
-            generator = Generator::CopyResourcesScript.new(resources_by_config, target.platform)
-            generator.save_as(path)
+            generator = Generator::CopyResourcesScript.new(target.resource_paths_by_config, target.platform)
+            update_changed_file(generator, path)
             add_file_to_support_group(path)
           end
 
           # Creates a script that embeds the frameworks to the bundle of the client
           # target.
           #
-          # @note   We can't use Xcode default copy bundle resource phase, because
-          #         we need to ensure that we only copy the resources, which are
+          # @note   We can't use Xcode default link libraries phase, because
+          #         we need to ensure that we only copy the frameworks which are
           #         relevant for the current build configuration.
           #
           # @return [void]
           #
           def create_embed_frameworks_script
             path = target.embed_frameworks_script_path
-            frameworks_and_dsyms_by_config = {}
-            target.user_build_configurations.keys.each do |config|
-              relevant_pod_targets = target.pod_targets.select do |pod_target|
-                pod_target.include_in_build_config?(target_definition, config)
-              end
-              frameworks_and_dsyms_by_config[config] = relevant_pod_targets.flat_map do |pod_target|
-                frameworks = pod_target.file_accessors.flat_map(&:vendored_dynamic_artifacts).map do |fw|
-                  path_to_framework = "${PODS_ROOT}/#{fw.relative_path_from(sandbox.root)}"
-                  # Until this can be configured, assume the dSYM file uses the file name as the framework.
-                  # See https://github.com/CocoaPods/CocoaPods/issues/1698
-                  { :framework => path_to_framework, :dSYM => "#{path_to_framework}.dSYM" }
-                end
-                # For non vendored frameworks Xcode will generate the dSYM and copy it instead.
-                frameworks << { :framework => pod_target.build_product_path('$BUILT_PRODUCTS_DIR'), :dSYM => nil } if pod_target.should_build? && pod_target.requires_frameworks?
-                frameworks
-              end
-            end
-            generator = Generator::EmbedFrameworksScript.new(frameworks_and_dsyms_by_config)
-            generator.save_as(path)
+            generator = Generator::EmbedFrameworksScript.new(target.framework_paths_by_config, target.xcframeworks_by_config)
+            update_changed_file(generator, path)
             add_file_to_support_group(path)
           end
 
@@ -190,17 +179,10 @@ module Pod
               path = generator_class.path_from_basepath(basepath)
               file_accessors = target.pod_targets.map(&:file_accessors).flatten
               generator = generator_class.new(file_accessors)
-              generator.save_as(path)
+              update_changed_file(generator, path)
               add_file_to_support_group(path)
             end
           end
-
-          # @return [Pathname] the path of the bridge support file relative to the
-          #         sandbox.
-          #
-          # @return [Nil] if no bridge support file was generated.
-          #
-          attr_reader :bridge_support_file
 
           #-----------------------------------------------------------------------#
         end

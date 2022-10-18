@@ -26,5 +26,6 @@ Pod::Spec.new do |s|
 
   s.subspec 'Bar' do |ss|
     ss.source_files = 'Bar/Bar.{h,m}'
+    ss.dependency 'monkey'
   end
 end

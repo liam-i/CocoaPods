@@ -8,7 +8,7 @@ module Pod
       #
       def fetch(sandbox)
         title = "Fetching podspec for `#{name}` #{description}"
-        UI.titled_section(title,  :verbose_prefix => '-> ') do
+        UI.section(title, '-> ') do
           podspec = podspec_path
           unless podspec.exist?
             raise Informative, "No podspec found for `#{name}` in " \
@@ -16,7 +16,7 @@ module Pod
           end
           store_podspec(sandbox, podspec, podspec.extname == '.json')
           is_absolute = absolute?(declared_path)
-          sandbox.store_local_path(name, podspec.dirname, is_absolute)
+          sandbox.store_local_path(name, podspec, is_absolute)
           sandbox.remove_checkout_source(name)
         end
       end
@@ -45,7 +45,7 @@ module Pod
         path.exist? ? path : Pathname("#{path}.json")
       end
 
-      # @return [Bool]
+      # @return [Boolean]
       #
       def absolute?(path)
         Pathname(path).absolute? || path.to_s.start_with?('~')

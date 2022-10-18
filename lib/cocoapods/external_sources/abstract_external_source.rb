@@ -19,23 +19,24 @@ module Pod
 
       # @return [Boolean] Whether the source is allowed to touch the cache.
       #
-      attr_accessor :can_cache
+      attr_reader :can_cache
       alias_method :can_cache?, :can_cache
 
       # Initialize a new instance
       #
-      # @param [String] name @see name
-      # @param [Hash] params @see params
-      # @param [String] podfile_path @see podfile_path
+      # @param [String] name @see #name
+      # @param [Hash] params @see #params
+      # @param [String] podfile_path @see #podfile_path
+      # @param [Boolean] can_cache @see #can_cache
       #
-      def initialize(name, params, podfile_path)
+      def initialize(name, params, podfile_path, can_cache = true)
         @name = name
         @params = params
         @podfile_path = podfile_path
-        @can_cache = true
+        @can_cache = can_cache
       end
 
-      # @return [Bool] whether an external source source is equal to another
+      # @return [Boolean] whether an external source source is equal to another
       #         according to the {#name} and to the {#params}.
       #
       def ==(other)
@@ -115,12 +116,16 @@ module Pod
             download_result = Downloader.download(download_request, target, :can_cache => can_cache)
           rescue Pod::DSLError => e
             raise Informative, "Failed to load '#{name}' podspec: #{e.message}"
-          rescue => _
-            raise Informative, "Failed to download '#{name}'."
+          rescue => e
+            raise Informative, "Failed to download '#{name}': #{e.message}"
           end
-          spec = download_result.spec
 
+          spec = download_result.spec
           raise Informative, "Unable to find a specification for '#{name}'." unless spec
+
+          # since the podspec might be cleaned, we want the checksum to refer
+          # to the json in the sandbox
+          spec.defined_in_file = nil
 
           store_podspec(sandbox, spec)
           sandbox.store_pre_downloaded_pod(name)
@@ -160,7 +165,7 @@ module Pod
                  when String
                    path = "#{name}.podspec"
                    path << '.json' if json
-                   Specification.from_string(spec, path)
+                   Specification.from_string(spec, path).tap { |s| s.defined_in_file = nil }
                  when Specification
                    spec.dup
                  else
@@ -169,12 +174,15 @@ module Pod
         rescue Pod::DSLError => e
           raise Informative, "Failed to load '#{name}' podspec: #{e.message}"
         end
-        spec.defined_in_file = nil
+
         validate_podspec(spec)
-        sandbox.store_podspec(name, spec.to_pretty_json, true, true)
+        sandbox.store_podspec(name, spec, true, true)
       end
 
       def validate_podspec(podspec)
+        defined_in_file = podspec.defined_in_file
+        podspec.defined_in_file = nil
+
         validator = validator_for_podspec(podspec)
         validator.quick = true
         validator.allow_warnings = true
@@ -185,10 +193,12 @@ module Pod
         unless validator.validated?
           raise Informative, "The `#{name}` pod failed to validate due to #{validator.failure_reason}:\n#{validator.results_message}"
         end
+      ensure
+        podspec.defined_in_file = defined_in_file
       end
 
       def validator_for_podspec(podspec)
-        Validator.new(podspec, [])
+        Validator.new(podspec, [], [])
       end
     end
   end

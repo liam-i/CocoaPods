@@ -25,7 +25,7 @@ module Pod
       #
       attr_accessor :output_io
 
-      # @return [Bool] Whether the wrapping of the strings to the width of the
+      # @return [Boolean] Whether the wrapping of the strings to the width of the
       #         terminal should be disabled.
       #
       attr_accessor :disable_wrap
@@ -62,6 +62,7 @@ module Pod
         self.indentation_level += relative_indentation
         self.title_level += 1
         yield if block_given?
+      ensure
         self.indentation_level -= relative_indentation
         self.title_level -= 1
       end
@@ -83,6 +84,7 @@ module Pod
         self.indentation_level += relative_indentation
         self.title_level += 1
         yield if block_given?
+      ensure
         self.indentation_level -= relative_indentation
         self.title_level -= 1
       end
@@ -114,6 +116,7 @@ module Pod
         self.indentation_level += relative_indentation
         self.title_level += 1
         yield if block_given?
+      ensure
         self.indentation_level -= relative_indentation
         self.title_level -= 1
       end
@@ -134,12 +137,17 @@ module Pod
       #        The indentation level relative to the current,
       #        when the message is printed.
       #
+      # @yield  The action, this block is always executed.
+      #
+      # @return [void]
+      #
       def message(message, verbose_prefix = '', relative_indentation = 2)
         message = verbose_prefix + message if config.verbose?
         puts_indented message if config.verbose?
 
         self.indentation_level += relative_indentation
         yield if block_given?
+      ensure
         self.indentation_level -= relative_indentation
       end
 
@@ -160,6 +168,7 @@ module Pod
         self.indentation_level += 2
         @treat_titles_as_messages = true
         yield if block_given?
+      ensure
         @treat_titles_as_messages = false
         self.indentation_level -= 2
       end
@@ -361,7 +370,7 @@ module Pod
       #
       # @param [String]  message The message to print.
       # @param [Array]   actions The actions that the user should take.
-      # @param [Bool]    verbose_only
+      # @param [Boolean]    verbose_only
       #        Restrict the appearance of the warning to verbose mode only
       #
       # return [void]
@@ -392,9 +401,9 @@ module Pod
 
       # @return [String] Wraps a string taking into account the width of the
       # terminal and an option indent. Adapted from
-      # http://blog.macromates.com/2006/wrapping-text-with-regular-expressions/
+      # https://macromates.com/blog/2006/wrapping-text-with-regular-expressions/
       #
-      # @param [String] txt     The string to wrap
+      # @param [String] string  The string to wrap
       #
       # @param [String] indent  The string to use to indent the result.
       #

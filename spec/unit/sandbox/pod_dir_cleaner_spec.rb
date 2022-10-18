@@ -20,8 +20,15 @@ module Pod
 
       paths_without_git.sort.should == %w(
         .git
+        .gitignore
         .gitmodules
         BananaLib.podspec
+        Classes/Documentation.docc
+        Classes/Documentation.docc/Documentation.md
+        docs
+        docs/guide1.md
+        docs/subdir
+        docs/subdir/guide2.md
         libPusher
         sub-dir
         sub-dir/sub-dir-2
@@ -34,7 +41,7 @@ module Pod
       relative_paths = paths.map { |p| p.gsub("#{@root}/", '') }
       relative_paths.sort.should == %w(
         Banana.modulemap
-        Bananalib.framework
+        BananaFramework.framework
         Classes/Banana.h
         Classes/Banana.m
         Classes/BananaLib.pch
@@ -43,15 +50,18 @@ module Pod
         LICENSE
         README
         Resources/Base.lproj
+        Resources/Base.lproj/Main.storyboard
         Resources/Images.xcassets
         Resources/Migration.xcmappingmodel
+        Resources/Sample.rcproject
         Resources/Sample.xcdatamodeld
         Resources/de.lproj
         Resources/en.lproj
+        Resources/en.lproj/Main.strings
         Resources/logo-sidebar.png
         Resources/sub_dir
         framework/Source/MoreBanana.h
-        libBananalib.a
+        libBananaStaticLib.a
         preserve_me.txt
       )
     end
@@ -70,7 +80,7 @@ module Pod
       relative_paths = paths.map { |p| p.gsub("#{@root}/", '') }
       relative_paths.sort.should == %w(
         Banana.modulemap
-        Bananalib.framework
+        BananaFramework.framework
         Classes/Banana.h
         Classes/Banana.m
         Classes/BananaLib.pch
@@ -78,14 +88,17 @@ module Pod
         LICENSE
         README
         Resources/Base.lproj
+        Resources/Base.lproj/Main.storyboard
         Resources/Images.xcassets
         Resources/Migration.xcmappingmodel
+        Resources/Sample.rcproject
         Resources/Sample.xcdatamodeld
         Resources/de.lproj
         Resources/en.lproj
+        Resources/en.lproj/Main.strings
         Resources/logo-sidebar.png
         Resources/sub_dir
-        libBananalib.a
+        libBananaStaticLib.a
         preserve_me.txt
       )
     end

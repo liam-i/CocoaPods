@@ -1,4 +1,5 @@
 require File.expand_path('../../spec_helper', __FILE__)
+require 'cocoapods/installer/project_cache/target_metadata.rb'
 
 module Pod
   # Expose to unit test file
@@ -77,6 +78,49 @@ module Pod
           group.source_tree.should == '<absolute>'
           group.path.should == @path.to_s
           Pathname.new(group.path).should.be.absolute
+        end
+      end
+
+      describe '#add_pod_subproject' do
+        it 'adds subprojects to the Development and Pods groups for Pods.xcodeproj' do
+          subproject1_path = config.sandbox.pod_target_project_path('SubprojA')
+          subproject2_path = config.sandbox.pod_target_project_path('SubprojB')
+          subproject1_path.mkpath
+          subproject2_path.mkpath
+          subproject1 = Project.new(subproject1_path)
+          subproject2 = Project.new(subproject2_path)
+          ref_a = @project.add_pod_subproject(subproject1)
+          ref_b = @project.add_pod_subproject(subproject2, true)
+
+          @project.main_group['Pods'].children.should.equal([ref_a])
+          @project.main_group['Development Pods'].children.should.equal([ref_b])
+          @project.main_group['Dependencies'].children.count.should.equal(0)
+        end
+
+        it 'adds subprojects to the Dependencies group if #pod_target_subproject is true' do
+          @project = Project.new(config.sandbox.project_path, false, Xcodeproj::Constants::DEFAULT_OBJECT_VERSION, :pod_target_subproject => true)
+          subproject1_path = config.sandbox.pod_target_project_path('SubprojA')
+          subproject2_path = config.sandbox.pod_target_project_path('SubprojB')
+          subproject1_path.mkpath
+          subproject2_path.mkpath
+          subproject1 = Project.new(subproject1_path)
+          subproject2 = Project.new(subproject2_path)
+          ref_a = @project.add_pod_subproject(subproject1)
+          ref_b = @project.add_pod_subproject(subproject2, true)
+
+          @project.main_group['Dependencies'].children.should.equal([ref_a, ref_b])
+          @project.main_group['Development Pods'].children.count.should.equal(0)
+          @project.main_group['Pods'].children.count.should.equal(0)
+        end
+      end
+
+      describe '#add_cached_pod_subproject' do
+        it 'adds cached subproject references' do
+          subproject_path = config.sandbox.pod_target_project_path('SubprojA')
+          subproject_path.mkpath
+          metadata = Installer::ProjectCache::TargetMetadata.new('LabelA', '0000', subproject_path)
+          ref = @project.add_cached_pod_subproject(config.sandbox, metadata)
+          @project.main_group['Pods'].children.should.equal([ref])
         end
       end
 
@@ -168,6 +212,7 @@ module Pod
         before do
           @project.add_pod_group('BananaLib', config.sandbox.pod_dir('BananaLib'), false)
           @file = config.sandbox.pod_dir('BananaLib') + 'file.m'
+          @pod_dir = config.sandbox.pod_dir('BananaLib')
           @nested_file = config.sandbox.pod_dir('BananaLib') + 'Dir/SubDir/nested_file.m'
           @localized_file = config.sandbox.pod_dir('BananaLib') + 'Dir/SubDir/de.lproj/Foo.strings'
           @group = @project.group_for_spec('BananaLib')
@@ -195,6 +240,15 @@ module Pod
           Pathname.any_instance.stubs(:realpath).returns(@nested_file)
           ref = @project.add_file_reference(@nested_file, @group, false)
           ref.hierarchy_path.should == '/Pods/BananaLib/nested_file.m'
+        end
+
+        it 'adds subgroups relative to shared base if requested' do
+          base_path = @pod_dir + 'Dir'
+          Pathname.any_instance.stubs(:realdirpath).returns(@pod_dir + 'Dir')
+          Pathname.any_instance.stubs(:realpath).returns(@nested_file)
+          ref = @project.add_file_reference(@nested_file, @group, true, base_path)
+          ref.hierarchy_path.should == '/Pods/BananaLib/SubDir/nested_file.m'
+          ref.parent.path.should == 'Dir/SubDir'
         end
 
         it "it doesn't duplicate file references for a single path" do
@@ -235,6 +289,17 @@ module Pod
 
           ref = @project.add_file_reference(sym_file, @group)
           ref.hierarchy_path.should == '/Pods/BananaLib/file.m'
+        end
+
+        it 'sets syntax to ruby when requested' do
+          Pathname.any_instance.stubs(:realpath).returns(@file)
+          ref = @project.add_file_reference(@file, @group)
+          @project.mark_ruby_file_ref(ref)
+          ref.xc_language_specification_identifier.should == 'xcode.lang.ruby'
+          ref.explicit_file_type.should == 'text.script.ruby'
+          ref.last_known_file_type.should == 'text'
+          ref.tab_width.should == '2'
+          ref.indent_width.should == '2'
         end
       end
 
@@ -345,7 +410,7 @@ module Pod
           @project.add_pod_group('BananaLib', config.sandbox.pod_dir('BananaLib'), false)
           @file = config.sandbox.pod_dir('BananaLib') + 'file.m'
           @group = @project.group_for_spec('BananaLib')
-          Pathname.any_instance.stubs(:realpath).returns(@file)
+          @file.stubs(:realpath).returns(@file)
           @project.add_file_reference(@file, @group)
         end
 
@@ -356,6 +421,7 @@ module Pod
 
         it 'returns nil if no reference for the given path is available' do
           another_file = config.sandbox.pod_dir('BananaLib') + 'another_file.m'
+          another_file.stubs(:realpath).returns(another_file)
           ref = @project.reference_for_path(another_file)
           ref.should.be.nil
         end

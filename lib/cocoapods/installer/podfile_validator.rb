@@ -8,20 +8,25 @@ module Pod
       #
       attr_reader :podfile
 
-      # @return [Array<String>] any errors that have occured during the validation
+      # @return [Array<String>] any errors that have occurred during the validation
       #
       attr_reader :errors
 
-      # @return [Array<String>] any warnings that have occured during the validation
+      # @return [Array<String>] any warnings that have occurred during the validation
       #
       attr_reader :warnings
 
       # Initialize a new instance
+      #
       # @param [Podfile] podfile
       #        The podfile to validate
       #
-      def initialize(podfile)
+      # @param [Analyzer::PodfileDependencyCache] podfile_dependency_cache
+      #        An (optional) cache of all the dependencies in the podfile
+      #
+      def initialize(podfile, podfile_dependency_cache = Analyzer::PodfileDependencyCache.from_podfile(podfile))
         @podfile = podfile
+        @podfile_dependency_cache = podfile_dependency_cache
         @errors = []
         @warnings = []
         @validated = false
@@ -31,6 +36,7 @@ module Pod
       # Errors are added to the errors array
       #
       def validate
+        validate_installation_options
         validate_pod_directives
         validate_no_abstract_only_pods!
         validate_dependencies_are_present!
@@ -66,12 +72,16 @@ module Pod
         warnings << warning
       end
 
-      def validate_pod_directives
-        dependencies = podfile.target_definitions.flat_map do |_, target|
-          target.dependencies
-        end.uniq
+      def validate_installation_options
+        installation_options = podfile.installation_options
 
-        dependencies.each do |dependency|
+        # Validate `incremental_installation` depends on `generate_multiple_pod_projects`
+        invalid = installation_options.incremental_installation? && installation_options.incremental_installation != installation_options.generate_multiple_pod_projects
+        add_error 'The installation option `incremental_installation` requires the option `generate_multiple_pod_projects` to also be enabled.' if invalid
+      end
+
+      def validate_pod_directives
+        @podfile_dependency_cache.podfile_dependencies.each do |dependency|
           validate_conflicting_external_sources!(dependency)
         end
       end
@@ -106,29 +116,49 @@ module Pod
       # @return [void]
       #
       def validate_dependencies_are_present!
-        if podfile.target_definitions.values.all?(&:empty?)
+        if @podfile_dependency_cache.target_definition_list.all?(&:empty?)
           add_warning 'The Podfile does not contain any dependencies.'
         end
       end
 
       # Verifies that no dependencies in the Podfile will end up not being built
-      # at all. In other words, all dependencies _must_ belong to a non-abstract
+      # at all. In other words, all dependencies should belong to a non-abstract
       # target, or be inherited by a target where `inheritance == complete`.
       #
       def validate_no_abstract_only_pods!
-        all_dependencies = podfile.dependencies
-        concrete_dependencies = podfile.target_definition_list.reject(&:abstract?).flat_map(&:dependencies).uniq
-        abstract_only_dependencies = all_dependencies - concrete_dependencies
-        abstract_only_dependencies.each do |dep|
-          add_error "The dependency `#{dep}` is not used in any concrete target."
+        @podfile_dependency_cache.target_definition_list.each do |target_definition|
+          dependencies = @podfile_dependency_cache.target_definition_dependencies(target_definition)
+          next if dependencies.empty?
+          next unless target_definition.abstract?
+
+          children = target_definition.recursive_children
+          next if children.any? { |child_target_definition| target_definition_inherits?(:parent => target_definition, :child => child_target_definition) }
+
+          add_warning "The abstract target #{target_definition.name} is not inherited by a concrete target, " \
+            "so the following dependencies won't make it into any targets in your project:" \
+            "\n    - #{dependencies.map(&:to_s).sort.join("\n    - ")}"
+
+          next if target_definition.platform
+
+          add_error "The abstract target #{target_definition.name} must specify a platform since its dependencies are not inherited by a concrete target."
+        end
+      end
+
+      def target_definition_inherits?(parent: nil, child: nil)
+        if parent == child
+          true
+        elsif child.exclusive?
+          false
+        else
+          target_definition_inherits?(:parent => parent, :child => child.parent)
         end
       end
 
       def validate_no_duplicate_targets!
-        podfile.target_definition_list.group_by { |td| [td.name, td.user_project_path] }.
+        @podfile_dependency_cache.target_definition_list.group_by { |td| [td.name, td.user_project_path] }.
           each do |(name, project), definitions|
           next unless definitions.size > 1
-          error = "The target `#{name}` is declared twice"
+          error = "The target `#{name}` is declared multiple times"
           error << " for the project `#{project}`" if project
           add_error(error << '.')
         end

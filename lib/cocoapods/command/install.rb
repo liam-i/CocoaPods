@@ -30,7 +30,16 @@ module Pod
       def self.options
         [
           ['--repo-update', 'Force running `pod repo update` before install'],
+          ['--deployment', 'Disallow any changes to the Podfile or the Podfile.lock during installation'],
+          ['--clean-install', 'Ignore the contents of the project cache and force a full pod installation. This only ' \
+            'applies to projects that have enabled incremental installation'],
         ].concat(super).reject { |(name, _)| name == '--no-repo-update' }
+      end
+
+      def initialize(argv)
+        super
+        @deployment = argv.flag?('deployment', false)
+        @clean_install = argv.flag?('clean-install', false)
       end
 
       def run
@@ -38,6 +47,8 @@ module Pod
         installer = installer_for_config
         installer.repo_update = repo_update?(:default => false)
         installer.update = false
+        installer.deployment = @deployment
+        installer.clean_install = @clean_install
         installer.install!
       end
     end

@@ -12,6 +12,22 @@ module Pod
       #       subspecs are added instead of the name of the Pods.
       #
       class SpecsState
+        # @return [Set<String>] the names of the pods that were added.
+        #
+        attr_reader :added
+
+        # @return [Set<String>] the names of the pods that were changed.
+        #
+        attr_reader :changed
+
+        # @return [Set<String>] the names of the pods that were deleted.
+        #
+        attr_reader :deleted
+
+        # @return [Set<String>] the names of the pods that were unchanged.
+        #
+        attr_reader :unchanged
+
         # Initialize a new instance
         #
         # @param  [Hash{Symbol=>String}] pods_by_state
@@ -38,31 +54,19 @@ module Pod
           end
         end
 
-        # @return [Set<String>] the names of the pods that were added.
-        #
-        attr_accessor :added
-
-        # @return [Set<String>] the names of the pods that were changed.
-        #
-        attr_accessor :changed
-
-        # @return [Set<String>] the names of the pods that were deleted.
-        #
-        attr_accessor :deleted
-
-        # @return [Set<String>] the names of the pods that were unchanged.
-        #
-        attr_accessor :unchanged
-
         # Displays the state of each pod.
         #
         # @return [void]
         #
         def print
-          added    .sort.each { |pod| UI.message('A'.green + " #{pod}", '', 2) }
-          deleted  .sort.each { |pod| UI.message('R'.red + " #{pod}", '', 2) }
-          changed  .sort.each { |pod| UI.message('M'.yellow + " #{pod}", '', 2) }
-          unchanged.sort.each { |pod| UI.message('-' + " #{pod}", '', 2) }
+          states = %i(added deleted changed unchanged)
+          lines(states).each do |line|
+            UI.message(line, '', 2)
+          end
+        end
+
+        def to_s(states: %i(added deleted changed unchanged))
+          lines(states).join("\n")
         end
 
         # Adds the name of a Pod to the give state.
@@ -77,6 +81,26 @@ module Pod
         #
         def add_name(name, state)
           send(state) << Specification.root_name(name)
+        end
+
+        private
+
+        # @return [Array<String>] A description of changes for the given states,
+        #                         one per line
+        #
+        def lines(states)
+          prefixes = {
+            :added     => 'A'.green,
+            :deleted   => 'R'.red,
+            :changed   => 'M'.yellow,
+            :unchanged => '-',
+          }
+
+          states.flat_map do |state|
+            send(state).sort.map do |pod|
+              prefixes[state.to_sym] + " #{pod}"
+            end
+          end
         end
       end
     end

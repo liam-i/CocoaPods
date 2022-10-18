@@ -132,7 +132,7 @@ module Pod
         spec = Specification.from_file(path)
         spec.version.should == Version.new('1.4.0')
         spec.source.should == { :git => 'https://github.com/lukeredpath/libPusher.git', :tag => '1.4.0' }
-        File.open(path, 'r') { |f| f.read.should.include ':tag => "#{s.version}"' }
+        File.open(path, 'r') { |f| f.read.should.include ':tag => "#{spec.version}"' }
       end
 
       it 'correctly reuses version variable in source if matching tag with prefix is found on github' do
@@ -151,7 +151,7 @@ module Pod
         spec = Specification.from_file(path)
         spec.version.should == Version.new('1.4.0')
         spec.source.should == { :git => 'https://github.com/lukeredpath/libPusher.git', :tag => 'v1.4.0' }
-        File.open(path, 'r') { |f| f.read.should.include ':tag => "v#{s.version}"' }
+        File.open(path, 'r') { |f| f.read.should.include ':tag => "v#{spec.version}"' }
       end
 
       it "raises an informative message when the GitHub repository doesn't have any commits" do
@@ -194,6 +194,10 @@ module Pod
     #-------------------------------------------------------------------------#
 
     describe Command::Spec::Lint do
+      before do
+        TrunkSource.new(fixture('spec-repos/trunk')).versions('JSONKit')
+      end
+
       it "complains if it can't find any spec to lint" do
         Dir.chdir(temporary_directory) do
           lambda { command('spec', 'lint').run }.should.raise Informative
@@ -207,8 +211,24 @@ module Pod
       end
 
       it 'lints the current working directory' do
-        Dir.chdir(fixture('spec-repos') + 'master/Specs/1/3/f/JSONKit/1.4/') do
+        Dir.chdir(fixture('spec-repos') + 'trunk/Specs/1/3/f/JSONKit/1.4/') do
           cmd = command('spec', 'lint', '--quick', '--allow-warnings')
+          cmd.run
+          UI.output.should.include 'passed validation'
+        end
+      end
+
+      it 'lints the current working directory using Debug configuration' do
+        Dir.chdir(fixture('spec-repos') + 'trunk/Specs/1/3/f/JSONKit/1.4/') do
+          cmd = command('spec', 'lint', '--quick', '--allow-warnings', '--configuration=Debug')
+          cmd.run
+          UI.output.should.include 'passed validation'
+        end
+      end
+
+      it 'analyzes the current working directory using Debug configuration' do
+        Dir.chdir(fixture('spec-repos') + 'trunk/Specs/1/3/f/JSONKit/1.4/') do
+          cmd = command('spec', 'lint', '--quick', '--allow-warnings', '--configuration=Debug', '--analyze')
           cmd.run
           UI.output.should.include 'passed validation'
         end
@@ -221,7 +241,7 @@ module Pod
       end
 
       before do
-        text = (fixture('spec-repos') + 'master/Specs/1/3/f/JSONKit/1.4/JSONKit.podspec.json').read
+        text = (fixture('spec-repos') + 'trunk/Specs/1/3/f/JSONKit/1.4/JSONKit.podspec.json').read
         text.gsub!(/.*license.*/, '"license": { "file": "LICENSE" },')
         file = temporary_directory + 'JSONKit.podspec.json'
         File.open(file, 'w') { |f| f.write(text) }
@@ -316,6 +336,12 @@ module Pod
         UI.output.should.include text.gsub(/\n/, '')
       end
 
+      it 'prints the path of a given podspec respecting the version' do
+        lambda { command('spec', 'which', '--version=3.1.0', 'AFNetworking').run }.should.not.raise
+        text = '3.1.0/AFNetworking.podspec'
+        UI.output.should.include text.gsub(/\n/, '')
+      end
+
       describe_regex_support('which')
     end
 
@@ -327,13 +353,20 @@ module Pod
 
       it 'cats the given podspec' do
         lambda { command('spec', 'cat', 'AFNetworking').run }.should.not.raise
-        UI.output.should.include fixture('spec-repos/master/Specs/a/7/5/AFNetworking/3.1.0/AFNetworking.podspec.json').read
+        UI.output.should.include fixture('spec-repos/trunk/Specs/a/7/5/AFNetworking/3.2.1/AFNetworking.podspec.json').read
       end
 
       it 'cats the first podspec from all podspecs' do
         UI.next_input = "1\n"
         run_command('spec', 'cat', '--show-all', 'AFNetworking')
-        UI.output.should.include fixture('spec-repos/master/Specs/a/7/5/AFNetworking/3.1.0/AFNetworking.podspec.json').read
+        output = UI.output.gsub(/[0-9]+: /, '')
+        first_spec_path = output.split("\n")[0]
+        UI.output.should.include Pathname.new(first_spec_path).read
+      end
+
+      it 'cats the first podspec from all podspecs matching the version' do
+        lambda { command('spec', 'cat', '--version=3.1.0', 'AFNetworking').run }.should.not.raise
+        UI.output.should.include fixture('spec-repos/trunk/Specs/a/7/5/AFNetworking/3.1.0/AFNetworking.podspec.json').read
       end
 
       describe_regex_support('cat')
@@ -357,7 +390,7 @@ module Pod
         ENV['EDITOR'] = 'podspeceditor'
         lambda { command('spec', 'edit', 'AFNetworking').run }.should.raise SystemExit
         UI.output.should.include '/bin/sh -i -c podspeceditor "$@" --'
-        UI.output.should.include 'fixtures/spec-repos/master/Specs/a/7/5/AFNetworking'
+        UI.output.should.include 'fixtures/spec-repos/trunk/Specs/a/7/5/AFNetworking'
       end
 
       it 'will raise if no editor is found' do
@@ -371,13 +404,16 @@ module Pod
         UI.next_input = "1\n"
         lambda { command('spec', 'edit', '--show-all', 'AFNetworking').run }.should.raise SystemExit
         UI.output.should.include '/bin/sh -i -c podspeceditor "$@" --'
-        UI.output.should.include 'fixtures/spec-repos/master/Specs/a/7/5/AFNetworking/1.2.0/AFNetworking.podspec'
+        UI.output.should.include 'fixtures/spec-repos/trunk/Specs/a/7/5/AFNetworking/1.2.0/AFNetworking.podspec.json'
       end
 
       it "complains if it can't find a spec file for the given spec" do
-        File.stubs(:exist?).returns(false)
+        # done in this unusual way because File#exist? is a global method and other
+        # code uses it during this test - CDNSource for example
+        File.stubs(:exist?).with { |f| f.to_s =~ /.*/ }.returns(true)
+        File.stubs(:exist?).with { |f| f.to_s =~ /AFNetworking/ }.returns(false)
         lambda { command('spec', 'edit', 'AFNetworking').run }.should.raise Informative
-        File.unstub(:exists?)
+        File.unstub(:exist?)
       end
 
       describe_regex_support('edit', SystemExit) { ENV['EDITOR'] = 'podspeceditor' }
@@ -394,7 +430,7 @@ module Pod
       describe '#get_path_of_spec' do
         it 'returns the path of the specification with the given name' do
           path = @command.send(:get_path_of_spec, 'AFNetworking')
-          path.should == fixture('spec-repos') + 'master/Specs/a/7/5/AFNetworking/3.1.0/AFNetworking.podspec.json'
+          path.should == fixture('spec-repos') + 'trunk/Specs/a/7/5/AFNetworking/3.2.1/AFNetworking.podspec.json'
         end
       end
     end

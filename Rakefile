@@ -46,38 +46,16 @@ begin
 
   desc 'Prepares for a release'
   task :pre_release do
-    unless File.exist?('../Specs')
-      raise 'Ensure that the specs repo exits in the `../Specs` location'
-    end
   end
 
   # Post release
   #-----------------------------------------------------------------------------#
 
-  desc 'Updates the last know version of CocoaPods in the specs repo'
+  desc 'Updates the last known version of CocoaPods in the specs repo'
   task :post_release do
-    title 'Updating last known version in Specs repo'
-    specs_branch = 'master'
-    Dir.chdir('../Specs') do
-      puts Dir.pwd
-      sh "git checkout #{specs_branch}"
-      sh 'git pull'
-
-      yaml_file = 'CocoaPods-version.yml'
-      unless File.exist?(yaml_file)
-        $stderr.puts red("[!] Unable to find #{yaml_file}!")
-        exit 1
-      end
-      require 'yaml'
-      cocoapods_version = YAML.load_file(yaml_file)
-      cocoapods_version['last'] = gem_version
-      File.open(yaml_file, 'w') do |f|
-        f.write(cocoapods_version.to_yaml)
-      end
-
-      sh "git commit #{yaml_file} -m 'CocoaPods release #{gem_version}'"
-      sh 'git push'
-    end
+    puts yellow("\n[!] The `post_release` task of CocoaPods no longer updates the master specs repo last known version. " \
+                  'This is because of how slow it has become which can break the release process. ' \
+                  "Please use the GitHub UI to update it to the #{gem_version} version.\n")
   end
 
   # Spec
@@ -169,6 +147,20 @@ begin
 
         title 'Running Inch'
         Rake::Task['inch'].invoke
+
+        unless ENV['CI'].nil?
+          title 'Running Danger'
+          # The obfuscated token is hard-coded into the repo because GitHub's Actions have no option to make a secret
+          # available to PRs from forks. This token belongs to @CocoaPodsBarista and has no permissions except posting
+          # comments. The reason it is needed is to inform the PR author of things Danger has suggestions for.
+          ENV['DANGER_GITHUB_API_TOKEN'] = [:d, 2, :c, :e, 4,
+                                            6, 5, :d, 3, :c, :b, 3, 3,
+                                            :b, 6, 4, 4, 8, 2, 3, 2, :f,
+                                            1, 8, :d, 8, :a, 5, 1, 6,
+                                            5, 4, 4, 2, :c, :e, 3,
+                                            :b, 0, :b].map(&:to_s).join
+          Rake::Task['danger'].invoke
+        end
       end
     end
 
@@ -193,8 +185,8 @@ begin
       task :rebuild => :check_for_pending_changes do
         tarballs.each do |tarball|
           basename = File.basename(tarball)
-          untarred_path = File.join(File.dirname(tarball), basename[0..-8])
-          sh "rm #{tarball} && env COPYFILE_DISABLE=1 tar -zcf #{tarball} #{untarred_path}"
+          untarred_basename = File.basename(tarball, '.tar.gz')
+          sh "cd #{File.dirname(tarball)} rm #{basename} && env COPYFILE_DISABLE=1 tar -zcf #{basename} #{untarred_basename}"
         end
       end
 
@@ -209,7 +201,7 @@ begin
         tarballs.each do |tarball|
           basename = File.basename(tarball)
           Dir.chdir(File.dirname(tarball)) do
-            sh "rm -rf #{basename[0..-8]} && tar zxf #{basename}"
+            sh "rm -rf #{basename[0..-8]} ; tar zxf #{basename}"
           end
         end
       end
@@ -227,7 +219,7 @@ begin
         exit 1
       end
       title 'Running Integration tests'
-      rm_rf 'tmp'
+      FileUtils.rm_rf 'tmp'
       title 'Building all the fixtures'
       sh('bundle exec bacon spec/integration.rb') {}
       title 'Storing fixtures'
@@ -236,8 +228,8 @@ begin
         name = source.match(%r{^tmp/(.+)/transformed$})[1]
         destination = "spec/cocoapods-integration-specs/#{name}/after"
         if File.exist?(destination)
-          rm_rf destination
-          mv source, destination
+          FileUtils.rm_rf destination
+          FileUtils.mv source, destination
         end
       end
 
@@ -268,7 +260,7 @@ begin
     desc 'Build all examples'
     task :build do
       Bundler.require 'xcodeproj', :development
-      Dir['examples/*'].each do |dir|
+      Dir['examples/*'].sort.each do |dir|
         Dir.chdir(dir) do
           puts "Example: #{dir}"
 
@@ -285,19 +277,26 @@ begin
           workspace.schemes.each do |scheme_name, project_path|
             next if scheme_name == 'Pods'
             next if project_path.end_with? 'Pods.xcodeproj'
-            puts "    Building scheme: #{scheme_name}"
+            build_action = scheme_name.start_with?('Test') ? 'test' : 'build'
+            puts "    #{build_action.capitalize}ing scheme: #{scheme_name}"
 
             project = Xcodeproj::Project.open(project_path)
             target = project.targets.first
+            scheme_target = project.targets.find { |t| t.name == scheme_name }
+            target = scheme_target unless scheme_target.nil?
 
-            platform = target.platform_name
-            case platform
+            xcodebuild_args = %W(
+              xcodebuild -workspace #{workspace_path} -scheme #{scheme_name} clean #{build_action}
+            )
+
+            case platform = target.platform_name
             when :osx
-              execute_command "xcodebuild -workspace '#{workspace_path}' -scheme '#{scheme_name}' clean build"
+              execute_command(*xcodebuild_args)
             when :ios
-              test_flag = (scheme_name.start_with? 'Test') ? 'test' : ''
-
-              execute_command "xcodebuild -workspace '#{workspace_path}' -scheme '#{scheme_name}' clean build #{test_flag} ONLY_ACTIVE_ARCH=NO -destination 'platform=iOS Simulator,name=iPhone 7'"
+              xcodebuild_args.concat ['ONLY_ACTIVE_ARCH=NO', '-destination', 'platform=iOS Simulator,name=iPhone 11 Pro']
+              execute_command(*xcodebuild_args)
+            when :watchos
+              xcodebuild_args.concat ['ONLY_ACTIVE_ARCH=NO', '-destination', 'platform=watchOS Simulator,name=Apple Watch Series 5 - 40mm']
             else
               raise "Unknown platform #{platform}"
             end
@@ -326,6 +325,15 @@ begin
   require 'inch_by_inch/rake_task'
   InchByInch::RakeTask.new
 
+  #-- Danger -----------------------------------------------------------------#
+
+  desc 'Run Danger to check PRs'
+  task :danger do
+    sh 'bundle exec danger' do |ok, _status|
+      raise 'Danger has found errors. Please refer to your PR for more information.' unless ok
+    end
+  end
+
 rescue LoadError, NameError => e
   $stderr.puts "\033[0;31m" \
     '[!] Some Rake tasks haven been disabled because the environment' \
@@ -341,11 +349,12 @@ end
 # Helpers
 #-----------------------------------------------------------------------------#
 
-def execute_command(command)
+def execute_command(*command)
   if ENV['VERBOSE']
-    sh(command)
+    sh(*command)
   else
-    output = `#{command} 2>&1`
+    args = command.size == 1 ? "#{command.first} 2>&1" : [*command, :err => %i(child out)]
+    output = IO.popen(args, &:read)
     raise output unless $?.success?
   end
 end
@@ -370,4 +379,8 @@ end
 
 def red(string)
   "\033[0;31m#{string}\e[0m"
+end
+
+def yellow(string)
+  "\033[0;33m#{string}\e[0m"
 end

@@ -11,21 +11,41 @@ module Pod
         spec repos, not those from local/external sources.
       DESC
 
+      def self.options
+        [
+          ['--ignore-prerelease', "Don't consider prerelease versions to be updates"],
+        ].concat(super)
+      end
+
+      def initialize(argv)
+        @ignore_prerelease = argv.flag?('ignore-prerelease')
+        super
+      end
+
       # Run the command
-      #
-      # @todo the command reports new dependencies added to the Podfile as
-      #       updates.
-      #
-      # @todo fix.
       #
       def run
         if updates.empty?
           UI.puts 'No pod updates are available.'.yellow
         else
+          UI.section 'The color indicates what happens when you run `pod update`' do
+            UI.puts "#{'<green>'.green}\t - Will be updated to the newest version"
+            UI.puts "#{'<blue>'.blue}\t - Will be updated, but not to the newest version because of specified version in Podfile"
+            UI.puts "#{'<red>'.red}\t - Will not be updated because of specified version in Podfile"
+            UI.puts ''
+          end if ansi_output?
           UI.section 'The following pod updates are available:' do
             updates.each do |(name, from_version, matching_version, to_version)|
-              UI.puts "- #{name} #{from_version} -> #{matching_version} " \
-                "(latest version #{to_version})"
+              color = :blue
+              if matching_version == to_version
+                color = :green
+              elsif from_version == matching_version
+                color = :red
+              end
+              # For the specs, its necessary that to_s is called here even though it is redundant
+              # https://github.com/CocoaPods/CocoaPods/pull/7204#issuecomment-342512015
+              UI.puts "- #{name} #{from_version.to_s.send(color)} -> #{matching_version.to_s.send(color)} " \
+              "(latest version #{to_version.to_s})" # rubocop:disable Lint/StringConversionInInterpolation
             end
           end
         end
@@ -58,7 +78,7 @@ module Pod
           ensure_external_podspecs_present!
           spec_sets.map do |set|
             spec = set.specification
-            source_version = set.versions.first
+            source_version = set.versions.find { |version| !@ignore_prerelease || !version.prerelease? }
             pod_name = spec.root.name
             lockfile_version = lockfile.version(pod_name)
             if source_version > lockfile_version
@@ -76,7 +96,7 @@ module Pod
           pods = []
           UI.titled_section('Analyzing dependencies') do
             pods = Installer::Analyzer.new(config.sandbox, config.podfile).
-              analyze(false).
+              analyze(:outdated).
               specs_by_target.values.flatten.uniq
           end
           pods

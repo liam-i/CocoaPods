@@ -4,7 +4,7 @@ module Pod
   describe ExternalSources::AbstractExternalSource do
     before do
       dependency = Dependency.new('Reachability', :git => fixture('integration/Reachability'))
-      @subject = ExternalSources.from_dependency(dependency, nil)
+      @subject = ExternalSources.from_dependency(dependency, nil, true)
       config.sandbox.prepare
     end
 
@@ -39,7 +39,7 @@ module Pod
       it 'raises a generic error if pre download fails' do
         Downloader.stubs(:download).raises(Pod::Downloader::DownloaderError.new('Some generic exception'))
         exception = lambda { @subject.send(:pre_download, config.sandbox) }.should.raise Informative
-        exception.message.should.include "Failed to download 'Reachability'"
+        exception.message.should.include "Failed to download 'Reachability': Some generic exception"
       end
 
       it 'raises appropriate error if a DSLError when storing a podspec from string' do
@@ -69,7 +69,6 @@ module Pod
     describe 'Subclasses helpers' do
       it 'pre-downloads the Pod and stores the relevant information in the sandbox' do
         @subject.expects(:validate_podspec).with do |spec|
-          spec.defined_in_file.should.be.nil
           spec.name.should == 'Reachability'
         end
         @subject.send(:pre_download, config.sandbox)
@@ -86,7 +85,8 @@ module Pod
 
       describe 'podspec validation' do
         before do
-          @podspec = Pod::Specification.from_file(fixture('spec-repos') + 'master/Specs/1/3/f/JSONKit/1.4/JSONKit.podspec.json')
+          TrunkSource.new(fixture('spec-repos/trunk')).versions('JSONKit')
+          @podspec = Pod::Specification.from_file(fixture('spec-repos') + 'trunk/Specs/1/3/f/JSONKit/1.4/JSONKit.podspec.json')
         end
 
         it 'returns a validator for the given podspec' do

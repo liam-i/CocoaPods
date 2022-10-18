@@ -33,24 +33,30 @@ module Pod
           dependency_graph = Molinillo::DependencyGraph.new
 
           if lockfile
-            explicit_dependencies = lockfile.to_hash['DEPENDENCIES'] || []
-            explicit_dependencies.each do |string|
-              dependency = Dependency.new(string)
-              dependency_graph.add_vertex(dependency.name, nil, true)
+            added_dependency_strings = Set.new
+
+            explicit_dependencies = lockfile.dependencies
+            explicit_dependencies.each do |dependency|
+              dependency_graph.add_vertex(dependency.name, dependency, true)
             end
 
             pods = lockfile.to_hash['PODS'] || []
             pods.each do |pod|
-              add_to_dependency_graph(pod, [], dependency_graph, pods_to_unlock)
+              add_to_dependency_graph(pod, [], dependency_graph, pods_to_unlock, added_dependency_strings)
             end
 
             pods_to_update = pods_to_update.flat_map do |u|
               root_name = Specification.root_name(u).downcase
-              dependency_graph.vertices.keys.select { |n| Specification.root_name(n).downcase == root_name }
+              dependency_graph.vertices.each_key.select { |n| Specification.root_name(n).downcase == root_name }
             end
 
             pods_to_update.each do |u|
               dependency_graph.detach_vertex_named(u)
+            end
+
+            dependency_graph.each do |vertex|
+              next unless dep = vertex.payload
+              dep.podspec_repo ||= lockfile.spec_repo(dep.root_name)
             end
           end
 
@@ -68,23 +74,26 @@ module Pod
 
         private
 
-        def self.add_child_vertex_to_graph(dependency_string, parents, dependency_graph, pods_to_unlock)
+        def self.add_child_vertex_to_graph(dependency_string, parents, dependency_graph, pods_to_unlock, added_dependency_strings)
+          return unless added_dependency_strings.add?(dependency_string)
           dependency = Dependency.from_string(dependency_string)
           if pods_to_unlock.include?(dependency.root_name)
             dependency = Dependency.new(dependency.name)
           end
-          dependency_graph.add_child_vertex(dependency.name, parents.empty? ? dependency : nil, parents, nil)
+          vertex = dependency_graph.add_child_vertex(dependency.name, nil, parents, nil)
+          dependency = vertex.payload.merge(dependency) if vertex.payload
+          vertex.payload = dependency
           dependency
         end
 
-        def self.add_to_dependency_graph(object, parents, dependency_graph, pods_to_unlock)
+        def self.add_to_dependency_graph(object, parents, dependency_graph, pods_to_unlock, added_dependency_strings)
           case object
           when String
-            add_child_vertex_to_graph(object, parents, dependency_graph, pods_to_unlock)
+            add_child_vertex_to_graph(object, parents, dependency_graph, pods_to_unlock, added_dependency_strings)
           when Hash
             object.each do |key, value|
-              dependency = add_child_vertex_to_graph(key, parents, dependency_graph, pods_to_unlock)
-              value.each { |v| add_to_dependency_graph(v, [dependency.name], dependency_graph, pods_to_unlock) }
+              dependency = add_child_vertex_to_graph(key, parents, dependency_graph, pods_to_unlock, added_dependency_strings)
+              value.each { |v| add_to_dependency_graph(v, [dependency.name], dependency_graph, pods_to_unlock, added_dependency_strings) }
             end
           end
         end

@@ -18,11 +18,6 @@ source 'https://rubygems.org'
 
 gemspec
 
-# This is the version that ships with OS X 10.10, so be sure we test against it.
-# At the same time, the 1.7.7 version won't install cleanly on Ruby > 2.2,
-# so we use a fork that makes a trivial change to a macro invocation.
-gem 'json', :git => 'https://github.com/segiddins/json.git', :branch => 'seg-1.7.7-ruby-2.2'
-
 group :development do
   cp_gem 'claide',                'CLAide'
   cp_gem 'cocoapods-core',        'Core'
@@ -30,7 +25,6 @@ group :development do
   cp_gem 'cocoapods-downloader',  'cocoapods-downloader'
   cp_gem 'cocoapods-plugins',     'cocoapods-plugins'
   cp_gem 'cocoapods-search',      'cocoapods-search'
-  cp_gem 'cocoapods-stats',       'cocoapods-stats'
   cp_gem 'cocoapods-trunk',       'cocoapods-trunk'
   cp_gem 'cocoapods-try',         'cocoapods-try'
   cp_gem 'molinillo',             'Molinillo'
@@ -39,21 +33,33 @@ group :development do
 
   gem 'cocoapods-dependencies', '~> 1.0.beta.1'
 
-  gem 'bacon'
-  gem 'mocha'
+  gem 'activesupport', '> 5', '< 6' # Pinned < 6 because 6 requires Ruby 2.5.0
+  gem 'bacon', :git => 'https://github.com/leahneukirchen/bacon.git'
+  gem 'mocha', '< 1.5'
   gem 'mocha-on-bacon'
+  gem 'netrc'
   gem 'prettybacon'
+  gem 'typhoeus'
   gem 'webmock'
+
+  gem 'bigdecimal', '~> 1.3.0'
+  gem 'public_suffix'
+  gem 'ruby-graphviz', '< 1.2.5'
 
   # Integration tests
   gem 'diffy'
-  gem 'clintegracon'
+  gem 'clintegracon', :git => 'https://github.com/mrackwitz/CLIntegracon.git'
 
   # Code Quality
-  gem 'inch_by_inch'
-  gem 'rubocop'
 
-  gem 'danger'
+  # Revert to released gem once https://github.com/segiddins/inch_by_inch/pull/5 lands and a new version is published
+  gem 'inch_by_inch', :git => 'https://github.com/CocoaPods/inch_by_inch.git', branch: 'loosen-dependency'
+  gem 'rubocop', '0.50.0'
+  gem 'simplecov', '< 0.18'
+
+  gem 'octokit', '~> 4.18.0'
+
+  gem 'danger', '~> 8.0'
 end
 
 group :debugging do

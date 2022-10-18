@@ -1,3 +1,4 @@
+require 'addressable'
 require 'uri'
 
 module Pod
@@ -8,8 +9,6 @@ module Pod
       # Called just as the investigation has begun.
       # Lets the user know that it's looking for an issue.
       #
-      # @param [query] String unused
-      #
       # @param [GhInspector::Inspector] inspector
       #        The current inspector
       #
@@ -19,18 +18,15 @@ module Pod
         UI.puts "Looking for related issues on #{inspector.repo_owner}/#{inspector.repo_name}..."
       end
 
-      # Called once the inspector has recieved a report with more than one issue,
+      # Called once the inspector has received a report with more than one issue,
       # showing the top 3 issues, and offering a link to see more.
       #
       # @param [GhInspector::InspectionReport] report
       #        Report a list of the issues
       #
-      # @param [GhInspector::Inspector] inspector
-      #        The current inspector
-      #
       # @return [void]
       #
-      def inspector_successfully_recieved_report(report, _)
+      def inspector_successfully_received_report(report, _)
         report.issues[0..2].each { |issue| print_issue_full(issue) }
 
         if report.issues.count > 3
@@ -39,17 +35,14 @@ module Pod
         end
       end
 
-      # Called once the report has been recieved, but when there are no issues found.
-      #
-      # @param [GhInspector::InspectionReport] report
-      #        An empty report
+      # Called once the report has been received, but when there are no issues found.
       #
       # @param [GhInspector::Inspector] inspector
       #        The current inspector
       #
       # @return [void]
       #
-      def inspector_recieved_empty_report(_, inspector)
+      def inspector_received_empty_report(_, inspector)
         UI.puts 'Found no similar issues. To create a new issue, please visit:'
         UI.puts "https://github.com/#{inspector.repo_owner}/#{inspector.repo_name}/issues/new"
       end
@@ -68,7 +61,7 @@ module Pod
       # @return [void]
       #
       def inspector_could_not_create_report(error, query, inspector)
-        safe_query = URI.escape query
+        safe_query = Addressable::URI.escape query
         UI.puts 'Could not access the GitHub API, you may have better luck via the website.'
         UI.puts "https://github.com/#{inspector.repo_owner}/#{inspector.repo_name}/search?q=#{safe_query}&type=Issues&utf8=✓"
         UI.puts "Error: #{error.name}"
@@ -77,14 +70,14 @@ module Pod
       private
 
       def print_issue_full(issue)
-        safe_url = URI.escape issue.html_url
+        safe_url = Addressable::URI.escape issue.html_url
         UI.puts " - #{issue.title}"
         UI.puts "   #{safe_url} [#{issue.state}] [#{issue.comments} comment#{issue.comments == 1 ? '' : 's'}]"
         UI.puts "   #{pretty_date(issue.updated_at)}"
         UI.puts ''
       end
 
-      # Taken from http://stackoverflow.com/questions/195740/how-do-you-do-relative-time-in-rails
+      # Taken from https://stackoverflow.com/questions/195740/how-do-you-do-relative-time-in-rails
       def pretty_date(date_string)
         date = Time.parse(date_string)
         a = (Time.now - date).to_i

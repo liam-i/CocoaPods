@@ -31,38 +31,33 @@ module Pod
         #
         attr_reader :sandbox
 
+        # @return [Podfile] The Podfile to analyze dependencies.
+        #
+        attr_reader :podfile
+
         # @return [Array<Specifications>] The specifications returned by the
         #         resolver.
         #
         attr_reader :specs
 
-        # @return [Bool] Whether the installation is performed in update mode.
+        # @return [Boolean] Whether the installation is performed in update mode.
         #
         attr_reader :update_mode
 
         alias_method :update_mode?, :update_mode
 
-        # @return [Lockfile] The lockfile of the installation as a fall-back if
-        #         there is no sandbox manifest. This is indented as a temporary
-        #         solution to prevent the full re-installation from users which
-        #         are upgrading from CP < 0.17.
-        #
-        # @todo   Remove for CP 0.18.
-        #
-        attr_reader :lockfile
-
         # Init a new SandboxAnalyzer
         #
         # @param [Sandbox] sandbox @see sandbox
+        # @param [Podfile] podfile @see podfile
         # @param [Array<Specifications>] specs @see specs
-        # @param [Bool] update_mode @see update_mode
-        # @param [Lockfile] lockfile @see lockfile
+        # @param [Boolean] update_mode @see update_mode
         #
-        def initialize(sandbox, specs, update_mode, lockfile = nil)
+        def initialize(sandbox, podfile, specs, update_mode)
           @sandbox = sandbox
+          @podfile = podfile
           @specs = specs
           @update_mode = update_mode
-          @lockfile = lockfile
         end
 
         # Performs the analysis to the detect the state of the sandbox respect
@@ -110,11 +105,11 @@ module Pod
         # @param  [String] pod
         #         the name of the Pod.
         #
-        # @return [Bool] Whether the Pod is added.
+        # @return [Boolean] Whether the Pod is added.
         #
         def pod_added?(pod)
           return true if resolved_pods.include?(pod) && !sandbox_pods.include?(pod)
-          return true unless folder_exist?(pod)
+          return true if !sandbox.local?(pod) && !folder_exist?(pod)
           false
         end
 
@@ -124,7 +119,7 @@ module Pod
         # @param  [String] pod
         #         the name of the Pod.
         #
-        # @return [Bool] Whether the Pod is deleted.
+        # @return [Boolean] Whether the Pod is deleted.
         #
         def pod_deleted?(pod)
           return true if !resolved_pods.include?(pod) && sandbox_pods.include?(pod)
@@ -143,13 +138,15 @@ module Pod
         # @param  [String] pod
         #         the name of the Pod.
         #
-        # @return [Bool] Whether the Pod is changed.
+        # @return [Boolean] Whether the Pod is changed.
         #
         def pod_changed?(pod)
           spec = root_spec(pod)
           return true if spec.version != sandbox_version(pod)
           return true if spec.checksum != sandbox_checksum(pod)
           return true if resolved_spec_names(pod) != sandbox_spec_names(pod)
+          podfile_dep = podfile_dependency(pod)&.tap { |dep| dep.podspec_repo = nil }
+          return true if podfile_dep != sandbox_dependency(pod)
           return true if sandbox.predownloaded?(pod)
           return true if folder_empty?(pod)
           false
@@ -164,7 +161,7 @@ module Pod
         # @return [Lockfile] The manifest to use for the sandbox.
         #
         def sandbox_manifest
-          sandbox.manifest || lockfile
+          sandbox.manifest
         end
 
         #--------------------------------------#
@@ -172,14 +169,14 @@ module Pod
         # @return [Array<String>] The name of the resolved Pods.
         #
         def resolved_pods
-          specs.map { |spec| spec.root.name }.uniq
+          @resolved_pods ||= specs.map { |spec| spec.root.name }.uniq
         end
 
         # @return [Array<String>] The name of the Pods stored in the sandbox
         #         manifest.
         #
         def sandbox_pods
-          sandbox_manifest.pod_names.map { |name| Specification.root_name(name) }.uniq
+          @sandbox_pods ||= sandbox_manifest.pod_names.map { |name| Specification.root_name(name) }.uniq
         end
 
         # @return [Array<String>] The name of the resolved specifications
@@ -232,6 +229,26 @@ module Pod
         #
         def sandbox_checksum(pod)
           sandbox_manifest.checksum(pod)
+        end
+
+        # @return [Dependency, nil] The dependency with the given name stored in the sandbox.
+        #
+        # @param  [String] pod
+        #         the name of the Pod.
+        #
+        def sandbox_dependency(pod)
+          sandbox_manifest.dependencies.find { |d| d.name == pod }
+        end
+
+        #--------------------------------------#
+
+        # @return [Dependency, nil] The dependency with the given name from the podfile.
+        #
+        # @param  [String] pod
+        #         the name of the Pod.
+        #
+        def podfile_dependency(pod)
+          podfile.dependencies.find { |d| d.name == pod }
         end
 
         #--------------------------------------#

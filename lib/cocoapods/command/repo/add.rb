@@ -5,7 +5,7 @@ module Pod
         self.summary = 'Add a spec repo'
 
         self.description = <<-DESC
-          Clones `URL` in the local spec-repos directory at `~/.cocoapods/repos/`. The
+          Clones `URL` in the local spec-repos directory at `#{Config.instance.repos_dir}`. The
           remote can later be referred to by `NAME`.
         DESC
 
@@ -34,9 +34,9 @@ module Pod
           unless @name && @url
             help! 'Adding a repo needs a `NAME` and a `URL`.'
           end
-          if @name == 'master' || @url =~ %r{github.com[:/]+cocoapods/specs}i
+          if @name == 'trunk'
             raise Informative,
-                  'To setup the master specs repo, please run `pod setup`.'
+                  "Repo name `trunk` is reserved for CocoaPods' main spec repo accessed via CDN."
           end
         end
 
@@ -77,14 +77,13 @@ module Pod
                       { :verbose => true }
                     else
                       {}
-          end
+                    end
 
           config.with_changes(changes) do
             Dir.chdir(config.repos_dir) do
-              command = ['clone', @url, @name]
-              if @progress
-                command << '--progress'
-              end
+              command = ['clone', @url]
+              command << '--progress' if @progress
+              command << '--' << @name
               git!(command)
             end
           end

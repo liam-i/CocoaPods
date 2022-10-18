@@ -5,10 +5,11 @@ module Pod
     FIXTURE_HEAD = Dir.chdir(SpecHelper.fixture('banana-lib')) { `git rev-parse HEAD`.chomp }
 
     before do
+      @podfile = Podfile.new
       @spec = fixture_spec('banana-lib/BananaLib.podspec')
       @spec.source = { :git => SpecHelper.fixture('banana-lib') }
       specs_by_platform = { :ios => [@spec] }
-      @installer = Installer::PodSourceInstaller.new(config.sandbox, specs_by_platform)
+      @installer = Installer::PodSourceInstaller.new(config.sandbox, @podfile, specs_by_platform)
     end
 
     #-------------------------------------------------------------------------#
@@ -18,7 +19,6 @@ module Pod
         it 'downloads the source' do
           @spec.source = { :git => SpecHelper.fixture('banana-lib'), :tag => 'v1.0' }
           @installer.install!
-          @installer.specific_source[:tag].should == 'v1.0'
           pod_folder = config.sandbox.pod_dir('BananaLib')
           pod_folder.should.exist
         end
@@ -26,9 +26,20 @@ module Pod
         it 'returns the checkout options of the downloader if any' do
           @spec.source = { :git => SpecHelper.fixture('banana-lib'), :branch => 'topicbranch' }
           @installer.install!
-          @installer.specific_source[:commit].should == '446b22414597f1bb4062a62c4eed7af9627a3f1b'
           pod_folder = config.sandbox.pod_dir('BananaLib')
           pod_folder.should.exist
+        end
+
+        it 'tries to remove stale local podspec if the source is not predownloaded, local or external' do
+          config.sandbox.expects(:remove_local_podspec).with('BananaLib').once
+          @installer.install!
+        end
+
+        it 'does not remove the local podspec if the source is local path' do
+          @spec.source = { :path => 'BananaLib.podspec' }
+          config.sandbox.store_local_path('BananaLib', 'BananaLib.podspec')
+          config.sandbox.expects(:remove_local_podspec).with('BananaLib').never
+          @installer.install!
         end
       end
 
@@ -93,14 +104,14 @@ module Pod
       #--------------------------------------#
 
       describe 'Options' do
-        it "doesn't downloads the source if the pod was already downloaded" do
+        it "doesn't download the source if the pod was already predownloaded" do
           @installer.stubs(:predownloaded?).returns(true)
           @installer.expects(:download_source).never
           @installer.stubs(:clean_installation)
           @installer.install!
         end
 
-        it "doesn't downloads the source if the pod has a local source" do
+        it "doesn't download the source if the pod has a local source" do
           config.sandbox.store_local_path('BananaLib', 'Some Path')
           @installer.expects(:download_source).never
           @installer.install!
@@ -110,6 +121,18 @@ module Pod
           config.sandbox.store_local_path('BananaLib', 'Some Path')
           @installer.expects(:clean_installation).never
           @installer.install!
+        end
+
+        it "doesn't download the source if the pod was already downloaded" do
+          @installer.stubs(:downloaded?).returns(true)
+          Installer::PodSourceDownloader.any_instance.expects(:download!).never
+          @installer.send(:download_source)
+        end
+
+        it 'correctly downloads the source if the pod was not already downloaded' do
+          @installer.stubs(:downloaded?).returns(false)
+          Installer::PodSourceDownloader.any_instance.expects(:download!)
+          @installer.send(:download_source)
         end
       end
 
